@@ -157,3 +157,38 @@ def generate_random_reference_trajectory_arc_mix(
         v_ref=v_ref,
         dt=dt,
     )
+
+
+def calculate_max_curvature_rates(
+    transition_length: float,
+    kappa_step_max: float,
+    v_max_kph: float,
+) -> tuple[float, float]:
+    """
+    generate_random_reference_trajectory_arc_mix のパラメータから
+    理論上の最大曲率変化率を算出する。
+
+    Args:
+        transition_length: 曲率遷移区間の長さ [m]
+        kappa_step_max: 隣接セグメント間の曲率差の最大値 [1/m]
+        v_max_kph: 目標速度の上限 [km/h]
+
+    Returns:
+        max_dk_ds: 空間に対する最大曲率変化率 [1/m^2] (dκ/ds)
+        max_dk_dt: 時間に対する最大曲率変化率 [1/(m*s)] (dκ/dt)
+                   ※ ステアリング動作速度の要件見積もりに使用
+    """
+    if transition_length <= 1e-6:
+        raise ValueError("transition_length must be greater than 0 to calculate rates.")
+
+    # 1. 空間微分 (dκ/ds) の最大値
+    # 線形遷移区間において、距離 transition_length で最大 kappa_step_max 変化する
+    max_dk_ds = kappa_step_max / transition_length
+
+    # 2. 時間微分 (dκ/dt) の最大値
+    # dκ/dt = (dκ/ds) * (ds/dt) = (dκ/ds) * v
+    # 速度が最大のときに、時間あたりの変化率は最大になる
+    v_max_ms = v_max_kph / 3.6
+    max_dk_dt = max_dk_ds * v_max_ms
+
+    return max_dk_ds, max_dk_dt

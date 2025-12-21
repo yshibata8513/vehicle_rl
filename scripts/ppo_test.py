@@ -13,6 +13,11 @@ from trajectory_generator import generate_random_reference_trajectory_arc_mix
 from ppo_agent_batched import PPOAgentBatched
 
 
+EVAL_MODE = False
+CKPT_PATH = None
+# CKPT_PATH = "./checkpoints/20251219_020201_update0200.pt"
+# CKPT_PATH = "./checkpoints/20251219_032229_update0050.pt"
+
 # ===== 実行ごとの一意な ID（学習開始時刻） =====
 RUN_ID = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 CHECKPOINT_DIR = "checkpoints"
@@ -51,6 +56,57 @@ def load_checkpoint(agent, ckpt_path, device="cpu"):
     print(f"[Checkpoint] Loaded: {ckpt_path} (run_id={run_id}, update={update})")
     return run_id, update
 
+def save_ref_traj_plots(traj, run_id, out_dir="ref_traj_plots", prefix="eval_ref_traj"):
+    """
+    ReferenceTrajectory 1本について
+      1) x-y プロット画像
+      2) s横軸で kappa_ref / v_ref の2段プロット画像
+    を作って保存する。
+
+    Returns:
+        (xy_path, prof_path)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # できるだけ一意になるように先頭点と長さも入れる（indexが無くても衝突しにくい）
+    tag = f"L{float(traj.s_ref[-1]):.0f}_x0{float(traj.x_ref[0]):.2f}_y0{float(traj.y_ref[0]):.2f}"
+    base = f"{prefix}_{run_id}_{tag}"
+
+    # 1) x-y
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.plot(traj.x_ref, traj.y_ref, label="ref")
+    ax.set_title("Reference XY")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.axis("equal")
+    ax.grid(True)
+    ax.legend(loc="best")
+    plt.tight_layout()
+    xy_path = os.path.join(out_dir, f"{base}_xy.png")
+    plt.savefig(xy_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 2) profiles (kappa_ref / v_ref vs s)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    axes[0].plot(traj.s_ref, traj.kappa_ref, label="kappa_ref")
+    axes[0].set_ylabel("kappa_ref [1/m]")
+    axes[0].grid(True)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(traj.s_ref, traj.v_ref, label="v_ref")
+    axes[1].set_xlabel("s [m]")
+    axes[1].set_ylabel("v_ref [m/s]")
+    axes[1].grid(True)
+    axes[1].legend(loc="best")
+
+    plt.tight_layout()
+    prof_path = os.path.join(out_dir, f"{base}_profiles.png")
+    plt.savefig(prof_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved: {xy_path}")
+    print(f"Saved: {prof_path}")
+    return xy_path, prof_path
 
 # ===== 共通設定 =====
 dt = 0.05
@@ -59,12 +115,39 @@ device = "cuda"
 dtype = torch.float32
 is_perturbed = False
 
+# # STAGE1
+# weights = RewardWeights(
+#     w_y=0.1,
+#     w_psi=10.0,
+#     w_v_under=0.1,
+#     w_v_over=1.5,
+#     w_ay=0.001,
+#     w_d_delta_ref = 0.01,
+# )
+
+# # STAGE2
+# weights = RewardWeights(
+#     w_y=0.1,
+#     w_psi=10.0,
+#     w_v_under=0.1,
+#     w_v_over=1.5,
+#     w_ay=0.001,
+#     w_d_delta_ref = 1.,
+# )
+
+# STAGE3
 weights = RewardWeights(
     w_y=0.1,
     w_psi=10.0,
     w_v_under=0.1,
     w_v_over=1.5,
     w_ay=0.001,
+    w_d_delta_ref = .1,
+    loss_y= "l2",
+    loss_psi = "l2",
+    loss_v = "l2",
+    loss_ay = "l2",
+    loss_d_delta_ref = "l2",
 )
 
 
@@ -85,16 +168,6 @@ def make_train_traj(seed=None):
 
 # ===== 学習用 ref_traj / env =====
 train_ref_trajs = [
-    # generate_random_reference_trajectory_arc_mix(
-    #     total_length=2000.0,
-    #     ds=1.0,
-    #     dt=dt,
-    #     v_min_kph=50.0,
-    #     v_max_kph=80.0,
-    #     R_min=100.0,
-    #     R_max=400.0,
-    #     seed=i,
-    # )
     make_train_traj()
     for i in range(B)
 ]
@@ -143,6 +216,30 @@ agent = PPOAgentBatched(
     device=device,
 )
 
+# STAGE3用
+# agent = PPOAgentBatched(
+#     obs_dim=obs_dim,
+#     action_dim=action_dim,
+#     num_envs=B,
+#     rollout_steps=64,      # そのまま
+#     lr=5e-5,               # 1e-4→5e-5（更新を半分に）
+#     gamma=0.99,
+#     lam=0.95,
+#     clip_eps=0.08,         # 0.1→0.08（更新幅を少し抑制）
+#     epochs=4,              # 5→4（過学習/崩壊を少し抑える）
+#     batch_size=512,        # 256→512（勾配ノイズ減らす）
+#     vf_coef=0.5,
+#     ent_coef=0.0005,       # 0.001→0.0005（探索を弱めて安定寄り）
+#     max_grad_norm=0.3,     # 0.5→0.3（スパイクで壊れるのを防ぐ）
+#     device=device,
+#     dtype=dtype,
+# )
+
+
+if CKPT_PATH is not None:
+    load_checkpoint(agent, CKPT_PATH, device="cuda")
+
+
 # agent = PPOAgentBatched(
 #     obs_dim=obs_dim,
 #     action_dim=action_dim,
@@ -165,23 +262,20 @@ agent = PPOAgentBatched(
 # ===== 評価用 env（小さめバッチ + 固定seed） =====
 EVAL_ENVS = 8
 eval_ref_trajs = [
-    # generate_random_reference_trajectory_arc_mix(
-    #     total_length=2000.0,
-    #     ds=1.0,
-    #     dt=dt,
-    #     v_min_kph=50.0,
-    #     v_max_kph=80.0,
-    #     R_min=100.0,
-    #     R_max=400.0,
-    #     seed=1000 + i,   # 学習とは別のシード
-    # )
     make_train_traj(seed=1000 + i)
     for i in range(EVAL_ENVS)
 ]
 
+# ---- eval_ref_trajs 作成直後に先頭4本を保存 ----
+for i,traj in enumerate(eval_ref_trajs[:4]):
+    save_ref_traj_plots(traj, i)
+
+
+
 eval_env = BatchedPathTrackingEnvFrenet(
     ref_trajs=eval_ref_trajs,
     vehicle_params=veh_params,
+    reward_weights=weights,  # ← これを追加
     max_steps=2000,
     device=device,
     dtype=dtype,
@@ -212,12 +306,6 @@ def evaluate_policy(
         xy_done = torch.zeros(B_eval, dtype=torch.bool, device=env.device)
 
         # 時系列用
-        #  - v, v_ref
-        #  - a_x（縦加速度）
-        #  - a_y（横加速度）
-        #  - delta（舵角）
-        #  - e_y（横偏差）
-        #  - e_psi_v（速度方向偏差）
         ts_v_hist = [[] for _ in range(num_xy_envs)]
         ts_vref_hist = [[] for _ in range(num_xy_envs)]
         ts_ax_hist = [[] for _ in range(num_xy_envs)]
@@ -225,6 +313,11 @@ def evaluate_policy(
         ts_delta_hist = [[] for _ in range(num_xy_envs)]
         ts_ey_hist = [[] for _ in range(num_xy_envs)]
         ts_epsi_hist = [[] for _ in range(num_xy_envs)]
+        # ★追加：d_delta_ref（ステア指令レート）
+        ts_ddelta_ref_hist = [[] for _ in range(num_xy_envs)]
+        ts_delta_geom_hist = [[] for _ in range(num_xy_envs)]
+        ts_s_hist = [[] for _ in range(num_xy_envs)]
+
 
     ep_returns = []
     ep_lengths = []
@@ -235,6 +328,9 @@ def evaluate_policy(
     ep_cost_psi_mean = []
     ep_cost_v_mean = []
     ep_cost_ay_mean = []
+    # ★追加：d_delta_ref の誤差（|d_delta_ref|）とコスト
+    ep_ddelta_ref_mean = []
+    ep_cost_ddelta_ref_mean = []
 
     for ep in range(num_episodes):
         obs, state = env.reset(init_state, is_perturbed=False)
@@ -252,11 +348,17 @@ def evaluate_policy(
         cost_v_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
         cost_ay_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
 
+        # ★追加
+        ddelta_ref_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
+        cost_ddelta_ref_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
+
         for t in range(max_steps):
             actions, log_probs, values = agent.act_batch(obs)
             next_obs, state, reward, done_step, info = env.step(
                 actions, compute_info=True
             )
+
+            delta_geom = info.get("delta_geom", None)  # (B,) 期待
 
             not_done = ~done
 
@@ -269,9 +371,10 @@ def evaluate_policy(
             epsi = obs[:, 1]      # e_psi_v
             v = obs[:, 2]         # v [m/s]
             a_long = obs[:, 3]    # 縦加速度 a_x
-            delta = obs[:, 4]     # 舵角
+            delta = obs[:, 4]     # （環境実装により delta_ref の可能性あり）
             v_ref_now = info["v_ref"]      # (B,)
             a_lat = info["a_y"]            # (B,) 横加速度 a_y
+            s = info["s"]
 
             dv = (v - v_ref_now).abs()
 
@@ -290,9 +393,23 @@ def evaluate_policy(
             cost_v_sum[not_done] += cost_v[not_done]
             cost_ay_sum[not_done] += cost_ay[not_done]
 
+            # ★追加：d_delta_ref 誤差（|d_delta_ref|）とコスト
+            # env が info に入れている想定（無い場合は actions からフォールバック）
+            if "d_delta_ref" in info:
+                d_delta_ref = info["d_delta_ref"]
+            else:
+                d_delta_ref = actions[:, 1]
+            if "cost_d_delta_ref" in info:
+                cost_d_delta_ref = info["cost_d_delta_ref"]
+            else:
+                cost_d_delta_ref = torch.zeros_like(reward)
+
+            ddelta_ref_sum[not_done] += d_delta_ref[not_done].abs()
+            cost_ddelta_ref_sum[not_done] += cost_d_delta_ref[not_done]
+
             # ---- XY & 時系列ログ（ep==0 のときだけ & その env がまだ初回エピソード未完了なら）----
             if save_xy and ep == 0:
-                veh_state = env.vehicle.state  # (B,8)
+                veh_state = env.vehicle.state  # (B, 9) 想定（delta_ref を含む）
 
                 for b in range(num_xy_envs):
                     if not xy_done[b]:
@@ -308,6 +425,11 @@ def evaluate_policy(
                         ts_delta_hist[b].append(delta[b].item())
                         ts_ey_hist[b].append(ey[b].item())
                         ts_epsi_hist[b].append(epsi[b].item())
+                        # ★追加
+                        ts_ddelta_ref_hist[b].append(d_delta_ref[b].item())
+                        if delta_geom is not None:
+                            ts_delta_geom_hist[b].append(delta_geom[b].item())
+                        ts_s_hist[b].append(info["s"][b].item())
 
             done = done | done_step
 
@@ -335,18 +457,13 @@ def evaluate_policy(
         ep_ey_mean.append((ey_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
         ep_epsi_mean.append((epsi_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
         ep_dv_mean.append((dv_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
-        ep_cost_y_mean.append(
-            (cost_y_sum[mask_valid] / ep_len[mask_valid].float()).cpu()
-        )
-        ep_cost_psi_mean.append(
-            (cost_psi_sum[mask_valid] / ep_len[mask_valid].float()).cpu()
-        )
-        ep_cost_v_mean.append(
-            (cost_v_sum[mask_valid] / ep_len[mask_valid].float()).cpu()
-        )
-        ep_cost_ay_mean.append(
-            (cost_ay_sum[mask_valid] / ep_len[mask_valid].float()).cpu()
-        )
+        ep_cost_y_mean.append((cost_y_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+        ep_cost_psi_mean.append((cost_psi_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+        ep_cost_v_mean.append((cost_v_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+        ep_cost_ay_mean.append((cost_ay_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+
+        ep_ddelta_ref_mean.append((ddelta_ref_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+        ep_cost_ddelta_ref_mean.append((cost_ddelta_ref_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
 
     # ---- 集計 ----
     ep_returns = torch.cat(ep_returns)
@@ -358,6 +475,9 @@ def evaluate_policy(
     ep_cost_psi_mean = torch.cat(ep_cost_psi_mean)
     ep_cost_v_mean = torch.cat(ep_cost_v_mean)
     ep_cost_ay_mean = torch.cat(ep_cost_ay_mean)
+
+    ep_ddelta_ref_mean = torch.cat(ep_ddelta_ref_mean)
+    ep_cost_ddelta_ref_mean = torch.cat(ep_cost_ddelta_ref_mean)
 
     ep_return_per_step = ep_returns / ep_lengths.float()
 
@@ -374,6 +494,9 @@ def evaluate_policy(
         "cost_psi_mean": ep_cost_psi_mean.mean().item(),
         "cost_v_mean": ep_cost_v_mean.mean().item(),
         "cost_ay_mean": ep_cost_ay_mean.mean().item(),
+        # ★追加：d_delta_ref の“誤差”とコスト
+        "d_delta_ref_abs_mean": ep_ddelta_ref_mean.mean().item(),
+        "cost_d_delta_ref_mean": ep_cost_ddelta_ref_mean.mean().item(),
     }
 
     # ---- XY プロット保存（4 走行を1画像に） + 時系列プロット ----
@@ -414,11 +537,11 @@ def evaluate_policy(
         for i in range(num_xy_envs):
             T = len(ts_v_hist[i])
             if T == 0:
-                continue  # 念のため
-            t_axis = [k * dt_local for k in range(T)]
+                continue
+            t_axis = ts_s_hist[i]  # ← s 軸
 
-            # 6 段プロット: v, a_x, a_y, delta, e_y, e_psi_v
-            fig, axes = plt.subplots(6, 1, figsize=(10, 14), sharex=True)
+            # ★ 7 段プロット: v, a_x, a_y, delta, e_y, e_psi_v, d_delta_ref
+            fig, axes = plt.subplots(7, 1, figsize=(10, 16), sharex=True)
 
             # 1) 車速 & 目標車速
             axes[0].plot(t_axis, ts_v_hist[i], label="v [m/s]")
@@ -439,10 +562,17 @@ def evaluate_policy(
             axes[2].grid(True)
             axes[2].legend(loc="upper right")
 
-            # 4) 舵角
+            # 4) 舵角（表示名はそのまま）
             delta_deg = [math.degrees(d) for d in ts_delta_hist[i]]
             axes[3].plot(t_axis, delta_deg, label="delta [deg]")
+
+            # ★追加：delta_geom を重ねる
+            if len(ts_delta_geom_hist[i]) == len(t_axis) and len(ts_delta_geom_hist[i]) > 0:
+                delta_geom_deg = [math.degrees(d) for d in ts_delta_geom_hist[i]]
+                axes[3].plot(t_axis, delta_geom_deg, label="delta_geom [deg]")
+
             axes[3].set_ylabel("Steering")
+            axes[3].set_ylim(-0.5,0.5)
             axes[3].grid(True)
             axes[3].legend(loc="upper right")
 
@@ -454,10 +584,17 @@ def evaluate_policy(
 
             # 6) 速度方向偏差 e_psi_v
             axes[5].plot(t_axis, ts_epsi_hist[i], label="e_psi_v [rad]")
-            axes[5].set_xlabel("time [s]")
             axes[5].set_ylabel("e_psi_v")
             axes[5].grid(True)
             axes[5].legend(loc="upper right")
+
+            # ★7) d_delta_ref（ステア指令レート）
+            ddelta_deg_s = [math.degrees(d) for d in ts_ddelta_ref_hist[i]]
+            axes[6].plot(t_axis, ddelta_deg_s, label="d_delta_ref [deg/s]")
+            axes[6].set_xlabel("time [s]")
+            axes[6].set_ylabel("d_delta_ref")
+            axes[6].grid(True)
+            axes[6].legend(loc="upper right")
 
             fig.suptitle(f"Eval time-series (env {i})")
             plt.tight_layout()
@@ -476,49 +613,50 @@ eval_interval = 10
 plot_env_idx = 0  # プロットする env index（学習環境側）
 
 for update in range(num_updates):
-    agent.buffer.reset()
-    obs_t = obs.clone()
+    if EVAL_MODE == False:
+        agent.buffer.reset()
+        obs_t = obs.clone()
 
-    # 10 回に 1 回 x-y ログ
-    log_xy = ((update + 1) % 10 == 0)
-    if log_xy:
-        x_hist = []
-        y_hist = []
+        # 10 回に 1 回 x-y ログ
+        log_xy = ((update + 1) % 10 == 0)
+        if log_xy:
+            x_hist = []
+            y_hist = []
 
-    for t in range(agent.rollout_steps):
-        actions, log_probs, values = agent.act_batch(obs_t)
-        next_obs, state, reward, done_step, info = train_env.step(actions, compute_info=False)
+        for t in range(agent.rollout_steps):
+            actions, log_probs, values = agent.act_batch(obs_t)
+            next_obs, state, reward, done_step, info = train_env.step(actions, compute_info=False)
 
-        agent.store_step(
-            obs_batch=obs_t,
-            actions=actions,
-            rewards=reward,
-            dones=done_step,
-            values=values,
-            log_probs=log_probs,
-        )
-
-        # # x-y ログ
-        # if log_xy:
-        #     x_hist.append(train_env.vehicle.state[plot_env_idx, 0].item())
-        #     y_hist.append(train_env.vehicle.state[plot_env_idx, 1].item())
-
-        # partial reset
-        if done_step.any():
-            obs_t, _ = train_env.partial_reset(
-                init_state=init_state,
-                done_mask=done_step,
-                is_perturbed=is_perturbed,
-                regenerate_traj=True,
+            agent.store_step(
+                obs_batch=obs_t,
+                actions=actions,
+                rewards=reward,
+                dones=done_step,
+                values=values,
+                log_probs=log_probs,
             )
-        else:
-            obs_t = next_obs
 
-    # PPO 更新
-    agent.update(last_obs=obs_t, last_done=done_step)
-    obs = obs_t.detach()
+            # # x-y ログ
+            # if log_xy:
+            #     x_hist.append(train_env.vehicle.state[plot_env_idx, 0].item())
+            #     y_hist.append(train_env.vehicle.state[plot_env_idx, 1].item())
 
+            # partial reset
+            if done_step.any():
+                obs_t, _ = train_env.partial_reset(
+                    init_state=init_state,
+                    done_mask=done_step,
+                    is_perturbed=is_perturbed,
+                    regenerate_traj=True,
+                )
+            else:
+                obs_t = next_obs
 
+        # PPO 更新
+        agent.update(last_obs=obs_t, last_done=done_step)
+        obs = obs_t.detach()
+
+    
     # ===== 評価 =====
     if (update + 1) % eval_interval == 0:
         eval_stats = evaluate_policy(
@@ -545,7 +683,11 @@ for update in range(num_updates):
         print(f"  mean cost_psi        : {eval_stats['cost_psi_mean']:.6f}")
         print(f"  mean cost_v          : {eval_stats['cost_v_mean']:.6f}")
         print(f"  mean cost_ay         : {eval_stats['cost_ay_mean']:.6f}")
+        print(f"  mean cost_d_delta_ref: {eval_stats['cost_d_delta_ref_mean']:.6f}")
         print(f"==============================\n")
+
+        if EVAL_MODE:
+            break
 
         # 例）「平均ステップ数が max_steps 近くまで伸びたら」セーブしたい場合
         if eval_stats["len_mean"] > eval_env.max_steps - 30:

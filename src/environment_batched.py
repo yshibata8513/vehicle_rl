@@ -18,6 +18,13 @@ class RewardWeights:
     w_v_under: float = 0.1  # 目標より遅いとき
     w_v_over: float = 1.5   # 目標より速いとき
     w_ay: float = 0.001      # 横加速度
+    w_d_delta_ref: float = 0.1  # ステア指令レート d_delta_ref の L2 ペナルティ
+    # 損失タイプ ("l1" or "l2")
+    loss_y: str = "l2"
+    loss_psi: str = "l2"
+    loss_v: str = "l2"
+    loss_ay: str = "l2"
+    loss_d_delta_ref: str = "l2"
 
 
 # obs の列順（参考）
@@ -26,7 +33,7 @@ OBS_KEYS = [
     "e_psi_v",
     "v",
     "a",
-    "delta",
+    "delta_ref",
     "r",
     "s",
     "v_ref",
@@ -49,7 +56,7 @@ class BatchedPathTrackingEnvFrenet:
         e_psi_v   : 速度ベクトルと経路方向の角度偏差 [rad]
         v, a, delta, beta, r : 車両ダイナミクス（bicycle_model 内の state）
     - step 入力:
-        action: (B, 2) torch.Tensor [a_ref, delta_ref]
+        action: (B, 2) torch.Tensor [a_ref, d_delta_ref]
     - step 出力:
         obs   : (B, obs_dim) torch.Tensor
         state : (B, state_dim) torch.Tensor
@@ -167,6 +174,39 @@ class BatchedPathTrackingEnvFrenet:
         self.e_psi_v = torch.zeros(self.B, dtype=self.dtype, device=self.device)
         self.step_count = torch.zeros(self.B, dtype=torch.int64, device=self.device)
 
+        # 直近に計算した obs/state と、その計算に必要な中間量をキャッシュ
+        # _compute_obs_state() が更新し、_compute_reward_done_info() が参照する。
+        self._cache: Dict[str, torch.Tensor] = {}
+
+    def _penalty(self, x: torch.Tensor, loss_type: str) -> torch.Tensor:
+        """loss_type に応じて L1/L2 を返す（要素ごと）"""
+        if loss_type == "l1":
+            return torch.abs(x)
+        if loss_type == "l2":
+            return x ** 2
+        raise ValueError(f"Unknown loss_type: {loss_type} (expected 'l1' or 'l2')")
+
+
+    # ---------- vehicle init_state 互換 (B,8)/(B,9) ----------
+
+    def _ensure_vehicle_init_state(self, init_state: torch.Tensor) -> torch.Tensor:
+        """(B,8)=[x,y,psi,v,a,delta,beta,r] を (B,9) に拡張して返す。
+
+        新しい車両モデルは state に delta_ref を保持するため (B,9) が正。
+        (B,8) の場合は delta_ref=delta で初期化する。
+        """
+        assert init_state.dim() == 2 and init_state.shape[0] == self.B, \
+            f"init_state must be (B,8) or (B,9) with B={self.B}, got {init_state.shape}"
+        assert init_state.shape[1] in (8, 9), \
+            f"init_state last dim must be 8 or 9, got {init_state.shape[1]}"
+
+        init_state = init_state.to(device=self.device, dtype=self.dtype)
+        if init_state.shape[1] == 9:
+            return init_state
+        # (B,8) -> (B,9) by appending delta_ref=delta
+        delta = init_state[:, 5:6]
+        return torch.cat([init_state, delta], dim=1)
+
     def _regenerate_trajectories_for_indices(
         self,
         idx: torch.Tensor,
@@ -238,7 +278,8 @@ class BatchedPathTrackingEnvFrenet:
             init_state[b, 1] = y0
             init_state[b, 2] = psi0
             init_state[b, 3] = v0
-            init_state[b, 4:] = 0.0  # a, delta, beta, r は 0 に戻す
+            # a, delta, beta, r (and delta_ref if present) は 0 に戻す
+            init_state[b, 4:] = 0.0
 
     # ---------- ユーティリティ ----------
 
@@ -323,7 +364,9 @@ class BatchedPathTrackingEnvFrenet:
         バッチ全体をリセット。
 
         Args:
-            init_state: (B, 8) = [x, y, psi, v, a, delta, beta, r]
+            init_state: (B, 8) または (B, 9)
+                (B, 8) = [x, y, psi, v, a, delta, beta, r]
+                (B, 9) = [x, y, psi, v, a, delta, beta, r, delta_ref]
             s0: (B,) 経路上の初期位置。None の場合は全バッチ s_ref[0]
             is_perturbed: True なら e_y, v, e_psi_v にランダムノイズを加える。
 
@@ -331,11 +374,9 @@ class BatchedPathTrackingEnvFrenet:
             obs:   (B, obs_dim) Tensor
             state: (B, state_dim) Tensor
         """
-        assert init_state.shape[0] == self.B and init_state.shape[1] == 8, \
-            f"init_state must be (B,8) with B={self.B}"
-
-        # 車両状態リセット
-        self.vehicle.reset(init_state)
+        # 車両状態リセット（(B,8)/(B,9) 互換）
+        init_state_v = self._ensure_vehicle_init_state(init_state)
+        self.vehicle.reset(init_state_v)
 
         # s0 初期化
         if s0 is None:
@@ -368,7 +409,7 @@ class BatchedPathTrackingEnvFrenet:
 
         self.step_count.zero_()
 
-        obs, state, _, _, _ = self._compute_obs_state_reward_done(compute_info=False)
+        obs, state = self._compute_obs_state()
         return obs, state
     
     def partial_reset(
@@ -399,7 +440,7 @@ class BatchedPathTrackingEnvFrenet:
         idx = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
         if idx.numel() == 0:
             # 何もリセットしない場合でも、最新の obs を返せるようにしておく
-            obs, state, _, _, _ = self._compute_obs_state_reward_done(compute_info=False)
+            obs, state = self._compute_obs_state()
             return obs, state
 
         # --- 必要なら traj を振り直す ---
@@ -407,7 +448,8 @@ class BatchedPathTrackingEnvFrenet:
             self._regenerate_trajectories_for_indices(idx, init_state)
 
         # --- vehicle.state を初期値に戻す ---
-        self.vehicle.state[idx] = init_state[idx].to(device=device, dtype=dtype)
+        init_state_v = self._ensure_vehicle_init_state(init_state)
+        self.vehicle.state[idx] = init_state_v[idx].to(device=device, dtype=dtype)
 
         # --- Frenet 状態を初期化 ---
         # s は共通 s_ref の先頭値
@@ -436,76 +478,45 @@ class BatchedPathTrackingEnvFrenet:
             self.e_psi_v[idx] += dpsi
 
         # リセット後の obs/state を返す
-        obs, state, _, _, _ = self._compute_obs_state_reward_done(compute_info=False)
+        obs, state = self._compute_obs_state()
         return obs, state
 
 
-    # ---------- 観測・報酬・終了判定 ----------
+    # ---------- 観測（obs/state） ----------
 
-    def _compute_obs_state_reward_done(
-        self,
-        compute_info: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, Any]]]:
+    def _compute_obs_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Frenet 状態と車両状態から obs, state を計算し、必要な中間量をキャッシュする。
+
+        呼び出し順序の前提:
+          1) _compute_obs_state() を呼ぶ（キャッシュを更新）
+          2) _compute_reward_done_info(action, ...) を呼ぶ（キャッシュを参照）
         """
-        Frenet 状態と車両状態から obs, state, reward, done, info を計算（バッチ全体分）。
-
-        Returns:
-            obs   : (B, obs_dim)
-            state : (B, state_dim)
-            reward: (B,)
-            done  : (B,)
-            info  : None または dict[str, Tensor]
-        """
-        B = self.B
-        w = self.weights
-        p = self.vehicle.params
-
         # 車両状態を取り出し
-        v = self.vehicle.state[:, 3]      # (B,)
+        v = self.vehicle.state[:, 3]
         a = self.vehicle.state[:, 4]
         delta = self.vehicle.state[:, 5]
         beta = self.vehicle.state[:, 6]
         r = self.vehicle.state[:, 7]
+        delta_ref = self.vehicle.state[:, 8]
 
         # 経路情報をバッチで補間
-        v_ref_now = self._interp_matrix(self.s, self.v_ref_mat)          # (B,)
-        kappa0 = self._interp_matrix(self.s, self.kappa_ref_mat)         # (B,)
-        # psi_ref は今は使っていないが、必要なら以下で取れる
-        # psi_ref = self._interp_matrix(self.s, self.psi_ref_mat)       # (B,)
-
-        # プレビュー曲率 (B, P)
+        v_ref_now = self._interp_matrix(self.s, self.v_ref_mat)
+        kappa0 = self._interp_matrix(self.s, self.kappa_ref_mat)
         kappa_preview = self._interp_matrix_preview(self.s, self.kappa_ref_mat)
 
         # 速度ベクトル方向の偏差は e_psi_v として状態で保持
         e_y = self.e_y
         e_psi_v = self._wrap_angle(self.e_psi_v)
 
-        # ---- 報酬計算 ----
-        cost_y = w.w_y * (e_y ** 2)
-        cost_psi = w.w_psi * (e_psi_v ** 2)
-
-        dv = v - v_ref_now
-        cost_v_under = w.w_v_under * (dv ** 2)
-        cost_v_over = w.w_v_over * (dv ** 2)
-        cost_v = torch.where(v <= v_ref_now, cost_v_under, cost_v_over)
-
-        F_yf = self.vehicle.F_yf
-        F_yr = self.vehicle.F_yr
-        a_y = (F_yf + F_yr) / p.m
-        cost_ay = w.w_ay * (a_y ** 2)
-
-        total_cost = cost_y + cost_psi + cost_v + cost_ay
-        reward = -total_cost  # (B,)
-
         # ---- obs / state ----
-        # obs: 経路情報を含む
+        # obs: 経路情報を含む（delta ではなく delta_ref を観測に出す）
         obs = torch.stack(
             [
                 e_y,
                 e_psi_v,
                 v,
                 a,
-                delta,
+                delta_ref,
                 r,
                 self.s,
                 v_ref_now,
@@ -514,13 +525,92 @@ class BatchedPathTrackingEnvFrenet:
                 kappa_preview[:, 1],
                 kappa_preview[:, 2],
             ],
-            dim=1,  # (B, 12)
-        )
+            dim=1,
+        )  # (B, 12)
 
-        # state: 経路情報は落として beta を入れる
+        # state: 経路情報は落として beta を入れ、delta_ref も含める
         state = torch.stack(
-            [e_y, e_psi_v, v, a, delta, beta, r], dim=1
-        )  # (B, 7)
+            [e_y, e_psi_v, v, a, delta, delta_ref, beta, r], dim=1
+        )  # (B, 8)
+
+        # ---- cache ----
+        self._cache = {
+            "v": v,
+            "a": a,
+            "delta": delta,
+            "beta": beta,
+            "r": r,
+            "delta_ref": delta_ref,
+            "v_ref_now": v_ref_now,
+            "kappa0": kappa0,
+            "kappa_preview": kappa_preview,
+            "e_y": e_y,
+            "e_psi_v": e_psi_v,
+        }
+
+        return obs, state
+
+    # ---------- 報酬・終了判定（reward/done/info） ----------
+
+    def _compute_reward_done_info(
+        self,
+        action: torch.Tensor,
+        compute_info: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, Any]]]:
+        """直近の _compute_obs_state() が作ったキャッシュを使って reward/done/info を計算する。"""
+        B = self.B
+        w = self.weights
+        p = self.vehicle.params
+
+        if not self._cache:
+            raise RuntimeError("_compute_obs_state() must be called before _compute_reward_done_info().")
+
+        # キャッシュから取り出し
+        v = self._cache["v"]
+        e_y = self._cache["e_y"]
+        e_psi_v = self._cache["e_psi_v"]
+        v_ref_now = self._cache["v_ref_now"]
+        delta_ref = self._cache["delta_ref"]
+
+        # ★追加：現在の s に対応する曲率 kappa(s)
+        # （_compute_obs_state() 側でキャッシュしていればそれを優先）
+        if "kappa0" in self._cache:
+            kappa0 = self._cache["kappa0"]
+        else:
+            kappa0 = self._interp_matrix(self.s, self.kappa_ref_mat)
+
+        delta_geom = self.vehicle.steering_from_kappa(kappa0)
+
+
+        # ---- 報酬計算 ----
+        # cost_y = w.w_y * (e_y ** 2)
+        # cost_psi = w.w_psi * (e_psi_v ** 2)
+        cost_y = w.w_y * self._penalty(e_y, w.loss_y)
+        cost_psi = w.w_psi * self._penalty(e_psi_v, w.loss_psi)
+
+        dv = v - v_ref_now
+        # cost_v_under = w.w_v_under * (dv ** 2)
+        # cost_v_over = w.w_v_over * (dv ** 2)
+        dv_pen = self._penalty(dv, w.loss_v)
+        cost_v_under = w.w_v_under * dv_pen
+        cost_v_over = w.w_v_over * dv_pen
+        cost_v = torch.where(v <= v_ref_now, cost_v_under, cost_v_over)
+
+        F_yf = self.vehicle.F_yf
+        F_yr = self.vehicle.F_yr
+        a_y = (F_yf + F_yr) / p.m
+        # cost_ay = w.w_ay * (a_y ** 2)
+        cost_ay = w.w_ay * self._penalty(a_y, w.loss_ay)
+
+        # d_delta_ref（ステア指令レート）のペナルティ（適用値で計算）
+        action = action.to(device=self.device, dtype=self.dtype)
+        assert action.shape == (B, 2), f"action shape must be ({B},2), got {action.shape}"
+        d_delta_ref_applied = torch.clamp(action[:, 1], -p.max_steer_rate, p.max_steer_rate)
+        # cost_d_delta_ref = w.w_d_delta_ref * (d_delta_ref_applied ** 2)
+        cost_d_delta_ref = w.w_d_delta_ref * self._penalty(d_delta_ref_applied, w.loss_d_delta_ref)
+
+        total_cost = cost_y + cost_psi + cost_v + cost_ay + cost_d_delta_ref
+        reward = -total_cost
 
         # ---- done 判定 ----
         done_lateral = torch.abs(e_y) > self.max_lateral_error
@@ -535,8 +625,14 @@ class BatchedPathTrackingEnvFrenet:
                 "cost_psi": cost_psi,
                 "cost_v": cost_v,
                 "cost_ay": cost_ay,
+                "cost_d_delta_ref": cost_d_delta_ref,
                 "a_y": a_y,
                 "v_ref": v_ref_now,
+                "s": self.s.data.clone(),  # ★追加：現在 s の曲率
+                "kappa0": kappa0,  # ★追加：現在 s の曲率
+                "delta_geom": delta_geom,  # ★追加：現在 s の曲率
+                "d_delta_ref": d_delta_ref_applied,
+                "delta_ref": delta_ref,
                 "done_lateral": done_lateral,
                 "done_pathend": done_pathend,
                 "done_steps": done_steps,
@@ -544,7 +640,7 @@ class BatchedPathTrackingEnvFrenet:
         else:
             info = None
 
-        return obs, state, reward, done, info
+        return reward, done, info
 
     # ---------- step ----------
 
@@ -555,7 +651,7 @@ class BatchedPathTrackingEnvFrenet:
         compute_info: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, Any]]]:
         """
-        action: (B, 2) [a_ref, delta_ref] の Tensor
+        action: (B, 2) [a_ref, d_delta_ref] の Tensor
         Returns:
             obs   : (B, obs_dim)
             state : (B, state_dim)
@@ -591,9 +687,11 @@ class BatchedPathTrackingEnvFrenet:
         # ステップ数カウント
         self.step_count += 1
 
-        # 3. obs, state, reward, done, info を計算
-        obs, state, reward, done, info = self._compute_obs_state_reward_done(
-            compute_info=compute_info
+        # 3. obs/state を計算（内部キャッシュ更新）→ reward/done/info を計算
+        obs, state = self._compute_obs_state()
+        reward, done, info = self._compute_reward_done_info(
+            action=action,
+            compute_info=compute_info,
         )
 
         if torch.isnan(self.vehicle.state).any():
