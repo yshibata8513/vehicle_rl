@@ -4,12 +4,13 @@ import os
 import datetime
 import torch
 import matplotlib.pyplot as plt
+import numpy as np
 
 import sys
 sys.path.append("../src")
-from bicycle_model_batched import VehicleParams
+from bicycle_model_batched import VehicleParams, calculate_max_d_delta_ref
 from environment_batched import BatchedPathTrackingEnvFrenet, RewardWeights
-from trajectory_generator import generate_random_reference_trajectory_arc_mix
+from trajectory_generator import generate_random_reference_trajectory_arc_mix, calculate_max_curvature_rates
 from ppo_agent_batched import PPOAgentBatched
 
 
@@ -208,12 +209,45 @@ obs_dim = obs.shape[1]
 action_dim = 2
 
 # ===== PPO エージェント =====
+# ===== PPO エージェント =====
+
+# Calculate action limits
+# 1. Curvature rates based on trajectory generation parameters
+max_dk_ds, max_dk_dt = calculate_max_curvature_rates(
+    transition_length=30.0,
+    kappa_step_max=0.002,
+    v_max_kph=60.0,
+)
+
+# 2. Required steering rate (geometric)
+max_d_delta_geom = calculate_max_d_delta_ref(
+    vehicle_params=veh_params,
+    max_dk_dt=max_dk_dt,
+)
+
+# 3. Set limits
+#    d_delta_ref needs margin -> 2.0x
+limit_d_delta = 2.0 * max_d_delta_geom
+
+#    a_ref limit -> 0.3G
+limit_accel = 0.3 * 9.80665
+
+print(f"[Limits] max_dk_dt    = {max_dk_dt:.4f} [1/(m*s)]")
+print(f"[Limits] max_d_delta  = {max_d_delta_geom:.4f} [rad/s] ({np.degrees(max_d_delta_geom):.1f} deg/s)")
+print(f"[Limits] limit_d_delta= {limit_d_delta:.4f} [rad/s] ({np.degrees(limit_d_delta):.1f} deg/s)")
+print(f"[Limits] limit_accel  = {limit_accel:.4f} [m/s^2]")
+
+action_min = np.array([-limit_accel, -limit_d_delta], dtype=np.float32)
+action_max = np.array([ limit_accel,  limit_d_delta], dtype=np.float32)
+
 agent = PPOAgentBatched(
     obs_dim=obs_dim,
     action_dim=action_dim,
     num_envs=B,
     rollout_steps=64,
     device=device,
+    action_min=action_min,
+    action_max=action_max,
 )
 
 # STAGE3用

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # =========================
@@ -20,19 +20,21 @@ class VehicleParams:
     tau_a: float = 0.3     # 加速度アクチュエータ時定数 [s]
     tau_delta: float = 0.3 # ステアアクチュエータ時定数 [s]
 
-    max_steer_deg: float = 30.0      # 最大舵角 [deg]
+    max_steer_deg: float = 30.0        # 最大舵角 [deg]
     max_steer_rate_deg: float = 180.0  # 最大舵角指令レート [deg/s]
-    max_accel: float = 3.0           # 最大加速 [m/s^2]
-    min_accel: float = -6.0          # 最大減速 [m/s^2]（負）
+    max_accel: float = 3.0             # 最大加速 [m/s^2]
+    min_accel: float = -6.0            # 最大減速 [m/s^2]（負）
+
+    # ---- 安定化用（タイヤ力飽和）----
+    mu: float = 0.9        # 摩擦係数（簡易飽和）
+    g: float = 9.81        # 重力加速度 [m/s^2]
 
     @property
     def max_steer(self) -> float:
-        # ラジアンに変換
         return self.max_steer_deg * 3.141592653589793 / 180.0
 
     @property
     def max_steer_rate(self) -> float:
-        # ラジアン/秒に変換
         return self.max_steer_rate_deg * 3.141592653589793 / 180.0
 
 
@@ -42,8 +44,6 @@ class VehicleParams:
 
 class BatchedDynamicBicycleModel(nn.Module):
     """
-    x, y, psi, v, a, delta, beta, r, delta_ref を状態にもつ線形動的 2輪モデル（バッチ対応）
-
     state: (B, 9)
         [0] x
         [1] y
@@ -53,16 +53,16 @@ class BatchedDynamicBicycleModel(nn.Module):
         [5] delta
         [6] beta
         [7] r
-        [8] delta_ref  (ステア指令角 [rad])
+        [8] delta_ref
 
     action: (B, 2)
         [0] a_ref
-        [1] d_delta_ref (delta_ref の時間微分指令 [rad/s])
+        [1] d_delta_ref
 
-    NOTE:
-      - 従来は action に delta_ref を直接入れていたが、舵角振動抑制のために
-        action を「delta_ref のレート入力」に変更した。
-      - delta_ref 自体は状態として保持し、step 内で積分して更新する。
+    ここでの方針（あなたの要望）:
+      - ZOH: 1回の step(dt) の間、action は固定
+      - サブステップ: 内部刻み dt_internal で dt を満たすまで複数回 Euler 更新
+      - タイヤ力飽和: Fy を +/- mu*Fz でクリップ（前後輪それぞれ）
     """
 
     def __init__(
@@ -70,169 +70,195 @@ class BatchedDynamicBicycleModel(nn.Module):
         params: Optional[VehicleParams] = None,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
+        dt_internal: float = 0.01,  # 内部更新周期
+        v_eff_min: float = 20./3.6,     # 低速特異性回避
     ):
         super().__init__()
         self.params = params if params is not None else VehicleParams()
         self.device = device
         self.dtype = dtype
 
+        self.dt_internal = float(dt_internal)
+        self.v_eff_min = float(v_eff_min)
+
+        # resetで初期化される
+        self.state: torch.Tensor
+        self.F_yf: torch.Tensor
+        self.F_yr: torch.Tensor
+
+        # 定数Fy上限をキャッシュ（テンソル化）
+        p = self.params
+        L = p.lf + p.lr
+        Fzf = (p.m * p.g) * (p.lr / L)
+        Fzr = (p.m * p.g) * (p.lf / L)
+        self.Fy_f_max = p.mu * Fzf
+        self.Fy_r_max = p.mu * Fzr
+
+
+
     @property
     def batch_size(self) -> int:
         return self.state.shape[0]
 
-    # --------------------
-    # 初期化
-    # --------------------
     def reset(self, init_state: torch.Tensor) -> torch.Tensor:
-        """
-        init_state: shape = (B, 9)
-          各列は [x, y, psi, v, a, delta, beta, r, delta_ref] を表す。
+        assert init_state.dim() == 2, f"init_state must be 2D (B,8|9), got {init_state.shape}"
+        assert init_state.size(1) in (8, 9), f"last dim must be 8 or 9, got {init_state.size(1)}"
 
-        互換のため、(B, 8) も受け付ける。その場合 delta_ref は delta と同じ値で初期化する。
-
-        このテンソルで内部状態 self.state を上書きする。
-        バッチサイズ B は init_state の 0 次元から自動で決まる。
-        """
-        assert init_state.dim() == 2, f"init_state must be 2D (B, 8|9), got {init_state.shape}"
-        assert init_state.size(1) in (8, 9), f"last dim of init_state must be 8 or 9, got {init_state.size(1)}"
-
-        # device / dtype を合わせる
         init_state = init_state.to(device=self.device, dtype=self.dtype)
 
-        # (B, 8) の場合は delta_ref を付与して (B, 9) に拡張
         if init_state.size(1) == 8:
             delta = init_state[:, 5:6]
             init_state = torch.cat([init_state, delta], dim=1)
 
         B = init_state.size(0)
-
-        # ここで新しいテンソルを割り当てる
         self.state = init_state.clone()
+
+        self._postprocess_inplace(self.state)
+
         self.F_yf = torch.zeros(B, dtype=self.dtype, device=self.device)
         self.F_yr = torch.zeros(B, dtype=self.dtype, device=self.device)
-
         return self.state.clone()
 
-    # --------------------
-    # step: バッチ一括更新
-    # --------------------
-    @torch.no_grad()
-    def step(self, action: torch.Tensor, dt: float) -> torch.Tensor:
-        """
-        action: (B, 2) = [a_ref, d_delta_ref]
-        dt: float （全バッチ共通）
-
-        戻り値: state (B, 9) の最新状態
-        """
+    def _postprocess_inplace(self, state: torch.Tensor) -> None:
         p = self.params
-        B = self.batch_size
+        # v >= 0
+        state[:, 3] = torch.clamp(state[:, 3], min=0.0)
+        # delta, delta_ref within physical bounds
+        state[:, 5] = torch.clamp(state[:, 5], -p.max_steer, p.max_steer)
+        state[:, 8] = torch.clamp(state[:, 8], -p.max_steer, p.max_steer)
 
-        assert action.shape == (B, 2), f"action shape must be ({B}, 2), got {action.shape}"
-
-        # 状態展開
-        x = self.state[:, 0]
-        y = self.state[:, 1]
-        psi = self.state[:, 2]
-        v = self.state[:, 3]
-        a = self.state[:, 4]
-        delta = self.state[:, 5]
-        beta = self.state[:, 6]
-        r = self.state[:, 7]
-        delta_ref = self.state[:, 8]
-
-        # --- 入力 a_ref, d_delta_ref をクリップ ---
-        a_ref = torch.clamp(action[:, 0], p.min_accel, p.max_accel)
-        d_delta_ref = torch.clamp(action[:, 1], -p.max_steer_rate, p.max_steer_rate)
-
-        # --- delta_ref の更新（舵角指令レートを積分） ---
-        dt_t = torch.as_tensor(dt, dtype=self.dtype, device=self.device)
-        delta_ref = delta_ref + d_delta_ref * dt_t
-        delta_ref = torch.clamp(delta_ref, -p.max_steer, p.max_steer)
-
-        # --- アクチュエータ一次遅れ ---
-        a_dot = (a_ref - a) / p.tau_a
-        delta_dot = (delta_ref - delta) / p.tau_delta
-
-        # --- タイヤモデル用の有効速度 ---
-        v_eff = torch.clamp(v, min=0.1)
-
-        # --- スリップ角 ---
+    def _tire_forces_with_saturation(self, beta, r, v_eff, delta):
+        p = self.params
         alpha_f = beta + p.lf * r / v_eff - delta
         alpha_r = beta - p.lr * r / v_eff
 
-        # --- タイヤ力（線形モデル） ---
         F_yf = -p.Cf * alpha_f
         F_yr = -p.Cr * alpha_r
 
-        # 保存（後で横加速度などに使いたいとき用）
-        self.F_yf = F_yf
-        self.F_yr = F_yr
+        F_yf = torch.clamp(F_yf, -self.Fy_f_max, self.Fy_f_max)
+        F_yr = torch.clamp(F_yr, -self.Fy_r_max, self.Fy_r_max)
+        return F_yf, F_yr
 
-        # --- β と r のダイナミクス ---
-        beta_dot = (F_yf + F_yr) / (p.m * v_eff) - r
-        r_dot = (p.lf * F_yf - p.lr * F_yr) / p.Iz
 
-        # --- 縦方向 ---
-        v_dot = a
+    @torch.no_grad()
+    def step(self, action: torch.Tensor, dt: float) -> torch.Tensor:
+        """
+        action はこの dt 区間で ZOH（固定）。
+        内部刻み dt_internal で Euler を複数回回して dt を消化する。
+        """
+        p = self.params
+        B = self.batch_size
+        assert action.shape == (B, 2), f"action shape must be ({B},2), got {action.shape}"
 
-        # --- 位置と姿勢 ---
-        psi_eff = psi + beta
-        x_dot = v * torch.cos(psi_eff)
-        y_dot = v * torch.sin(psi_eff)
-        psi_dot = r
+        # --- 入力クリップ（ZOHで固定）---
+        a_ref = torch.clamp(action[:, 0], p.min_accel, p.max_accel)
+        d_delta_ref = torch.clamp(action[:, 1], -p.max_steer_rate, p.max_steer_rate)
 
-        # --- 状態更新（オイラー） ---
-        x = x + x_dot * dt_t
-        y = y + y_dot * dt_t
-        psi = psi + psi_dot * dt_t
-        v = v + v_dot * dt_t
-        a = a + a_dot * dt_t
-        delta = delta + delta_dot * dt_t
-        beta = beta + beta_dot * dt_t
-        r = r + r_dot * dt_t
+        dt_total = float(dt)
+        dt_int = float(self.dt_internal)
+        if dt_int <= 0.0:
+            raise ValueError(f"dt_internal must be > 0, got {dt_int}")
 
-        # --- 後処理（クリップなど） ---
-        v = torch.clamp(v, min=0.0)
-        delta = torch.clamp(delta, -p.max_steer, p.max_steer)
+        # 固定回数 + 端数
+        n_full = int(dt_total // dt_int)
+        dt_rem = dt_total - n_full * dt_int
 
-        # 状態をまとめて保存
-        self.state[:, 0] = x
-        self.state[:, 1] = y
-        self.state[:, 2] = psi
-        self.state[:, 3] = v
-        self.state[:, 4] = a
-        self.state[:, 5] = delta
-        self.state[:, 6] = beta
-        self.state[:, 7] = r
-        self.state[:, 8] = delta_ref
+        # 力ログ（最後のサブステップの値にする／必要なら平均化も可能）
+        last_F_yf = None
+        last_F_yr = None
+
+        def euler_substep(h: float) -> None:
+            nonlocal last_F_yf, last_F_yr
+
+            h_t = torch.as_tensor(h, dtype=self.dtype, device=self.device)
+
+            # state unpack (views)
+            x = self.state[:, 0]
+            y = self.state[:, 1]
+            psi = self.state[:, 2]
+            v = self.state[:, 3]
+            a = self.state[:, 4]
+            delta = self.state[:, 5]
+            beta = self.state[:, 6]
+            r = self.state[:, 7]
+            delta_ref = self.state[:, 8]
+
+            # --- delta_ref integrate (ZOH d_delta_ref) ---
+            delta_ref = delta_ref + d_delta_ref * h_t
+            delta_ref = torch.clamp(delta_ref, -p.max_steer, p.max_steer)
+
+            # --- 1st order actuators ---
+            a_dot = (a_ref - a) / p.tau_a
+            delta_dot = (delta_ref - delta) / p.tau_delta
+
+            # --- effective speed ---
+            v_eff = torch.clamp(v, min=self.v_eff_min)
+
+            # --- tire forces with saturation ---
+            F_yf, F_yr = self._tire_forces_with_saturation(beta=beta, r=r, v_eff=v_eff, delta=delta)
+            last_F_yf, last_F_yr = F_yf, F_yr
+
+            # --- beta, r dynamics ---
+            beta_dot = (F_yf + F_yr) / (p.m * v_eff) - r
+            r_dot = (p.lf * F_yf - p.lr * F_yr) / p.Iz
+
+            # --- longitudinal ---
+            v_dot = a
+
+            # --- kinematics ---
+            psi_eff = psi + beta
+            x_dot = v * torch.cos(psi_eff)
+            y_dot = v * torch.sin(psi_eff)
+            psi_dot = r
+
+            # --- Euler update ---
+            x = x + x_dot * h_t
+            y = y + y_dot * h_t
+            psi = psi + psi_dot * h_t
+            v = v + v_dot * h_t
+            a = a + a_dot * h_t
+            delta = delta + delta_dot * h_t
+            beta = beta + beta_dot * h_t
+            r = r + r_dot * h_t
+
+            # postprocess
+            v = torch.clamp(v, min=0.0)
+            delta = torch.clamp(delta, -p.max_steer, p.max_steer)
+
+            # write back
+            self.state[:, 0] = x
+            self.state[:, 1] = y
+            self.state[:, 2] = psi
+            self.state[:, 3] = v
+            self.state[:, 4] = a
+            self.state[:, 5] = delta
+            self.state[:, 6] = beta
+            self.state[:, 7] = r
+            self.state[:, 8] = delta_ref
+
+        # full substeps
+        for _ in range(n_full):
+            euler_substep(dt_int)
+
+        # remaining fraction
+        if dt_rem > 1e-12:
+            euler_substep(dt_rem)
+
+        # save last forces
+        if last_F_yf is not None:
+            self.F_yf = last_F_yf
+            self.F_yr = last_F_yr
 
         return self.state.clone()
 
     @torch.no_grad()
     def steering_from_kappa(self, kappa0: torch.Tensor) -> torch.Tensor:
-        """
-        曲率 kappa0 から幾何学（キネマティック）に必要な舵角を推定して返す。
-
-        前提:
-        - 低スリップ近似（β≈0）かつ自転車モデルの幾何学関係
-        - ホイールベース L = lf + lr
-        - 曲率 κ と舵角 δ の関係: κ = tan(δ) / L  =>  δ = atan(L * κ)
-
-        Args:
-            kappa0: (B,) 現在の s に対応する曲率 [1/m]
-
-        Returns:
-            delta_geom: (B,) 幾何学的舵角 [rad]（±max_steer でクリップ）
-        """
         p = self.params
         kappa0 = kappa0.to(device=self.device, dtype=self.dtype)
 
         L = torch.as_tensor(p.lf + p.lr, dtype=self.dtype, device=self.device)
         delta_geom = torch.atan(L * kappa0)
-
-        # 物理上限でクリップ
-        delta_geom = torch.clamp(delta_geom, -p.max_steer, p.max_steer)
-        return delta_geom
+        return torch.clamp(delta_geom, -p.max_steer, p.max_steer)
 
 
 
