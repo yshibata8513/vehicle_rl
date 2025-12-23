@@ -571,6 +571,7 @@ class BatchedPathTrackingEnvFrenet:
         e_psi_v = self._cache["e_psi_v"]
         v_ref_now = self._cache["v_ref_now"]
         delta_ref = self._cache["delta_ref"]
+        beta = self._cache["beta"]
 
         # ★追加：現在の s に対応する曲率 kappa(s)
         # （_compute_obs_state() 側でキャッシュしていればそれを優先）
@@ -582,11 +583,15 @@ class BatchedPathTrackingEnvFrenet:
         delta_geom = self.vehicle.steering_from_kappa(kappa0)
 
 
+
         # ---- 報酬計算 ----
         # cost_y = w.w_y * (e_y ** 2)
         # cost_psi = w.w_psi * (e_psi_v ** 2)
         cost_y = w.w_y * self._penalty(e_y, w.loss_y)
-        cost_psi = w.w_psi * self._penalty(e_psi_v, w.loss_psi)
+
+        # 速度ベクトル方向の偏差 = e_psi_v (車体向き偏差) + beta (スリップ角)
+        e_psi_vel = self._wrap_angle(e_psi_v + beta)
+        cost_psi = w.w_psi * self._penalty(e_psi_vel, w.loss_psi)
 
         dv = v - v_ref_now
         # cost_v_under = w.w_v_under * (dv ** 2)
@@ -693,6 +698,12 @@ class BatchedPathTrackingEnvFrenet:
             action=action,
             compute_info=compute_info,
         )
+
+        if not torch.isfinite(self.vehicle.state).all():
+            print("Non-finite in vehicle.state",
+                "maxabs:", self.vehicle.state.abs().max().item())
+            raise RuntimeError("Inf/NaN in vehicle.state")
+
 
         if torch.isnan(self.vehicle.state).any():
             print("NaN in vehicle.state, step_count:", self.step_count.max().item())
