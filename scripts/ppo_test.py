@@ -1,5 +1,3 @@
-
-
 import os
 import datetime
 import torch
@@ -57,6 +55,7 @@ def load_checkpoint(agent, ckpt_path, device="cpu"):
     print(f"[Checkpoint] Loaded: {ckpt_path} (run_id={run_id}, update={update})")
     return run_id, update
 
+
 def save_ref_traj_plots(traj, run_id, out_dir="ref_traj_plots", prefix="eval_ref_traj"):
     """
     ReferenceTrajectory 1本について
@@ -109,6 +108,7 @@ def save_ref_traj_plots(traj, run_id, out_dir="ref_traj_plots", prefix="eval_ref
     print(f"Saved: {prof_path}")
     return xy_path, prof_path
 
+
 # ===== 共通設定 =====
 dt = 0.05
 B = 64              # 学習用バッチサイズ
@@ -120,26 +120,6 @@ is_perturbed = False
 R_MIN = 100.0
 
 
-# # STAGE1
-# weights = RewardWeights(
-#     w_y=0.1,
-#     w_psi=10.0,
-#     w_v_under=0.1,
-#     w_v_over=1.5,
-#     w_ay=0.001,
-#     w_d_delta_ref = 0.01,
-# )
-
-# # STAGE2
-# weights = RewardWeights(
-#     w_y=0.1,
-#     w_psi=10.0,
-#     w_v_under=0.1,
-#     w_v_over=1.5,
-#     w_ay=0.001,
-#     w_d_delta_ref = 1.,
-# )
-
 # STAGE3
 weights = RewardWeights(
     w_y=0.1,
@@ -147,16 +127,16 @@ weights = RewardWeights(
     w_v_under=0.1,
     w_v_over=1.5,
     w_ay=0.001,
-    w_d_delta_ref = .1,
-    loss_y= "l2",
-    loss_psi = "l2",
-    loss_v = "l2",
-    loss_ay = "l2",
-    loss_d_delta_ref = "l2",
+    w_d_delta_ref=.1,
+    loss_y="l2",
+    loss_psi="l2",
+    loss_v="l2",
+    loss_ay="l2",
+    loss_d_delta_ref="l2",
 )
 
-
 veh_params = VehicleParams()
+
 
 def make_train_traj(seed=None):
     # train 用の経路条件（いままで trafin_ref_trajs を作っていた条件と同じにする）
@@ -166,11 +146,11 @@ def make_train_traj(seed=None):
         dt=dt,
         v_min_kph=40.0,
         v_max_kph=60.0,
-        v_max_kph=60.0,
         R_min=R_MIN,
         R_max=400.0,
         seed=None,   # reset ごとにランダム
     )
+
 
 # ===== 学習用 ref_traj / env =====
 train_ref_trajs = [
@@ -178,10 +158,14 @@ train_ref_trajs = [
     for i in range(B)
 ]
 
+# Kappa preview offsets: 0m to 20m, step=1.0m (21 points)
+kappa_preview_offsets = [float(i) for i in range(21)]
+
 train_env = BatchedPathTrackingEnvFrenet(
     ref_trajs=train_ref_trajs,
     vehicle_params=veh_params,
     reward_weights=weights,  # 明示的に渡す
+    kappa_preview_offsets=kappa_preview_offsets,
     max_steps=2000,
     device=device,
     dtype=dtype,
@@ -208,12 +192,12 @@ def make_init_state(ref_trajs, device, dtype):
         init_state_local[b, 3] = v0
     return init_state_local
 
+
 init_state = make_init_state(train_ref_trajs, device, dtype)
-obs, state = train_env.reset(init_state, is_perturbed=is_perturbed)
+obs, _, state = train_env.reset(init_state, is_perturbed=is_perturbed)  # ★ reset は (obs_norm, obs_raw, state)
 obs_dim = obs.shape[1]
 action_dim = 2
 
-# ===== PPO エージェント =====
 # ===== PPO エージェント =====
 
 # Calculate action limits
@@ -245,15 +229,17 @@ limit_delta = 3.0 * float(delta_geom_max)
 # Clamp to physical max steer just in case
 limit_delta = min(limit_delta, veh_params.max_steer)
 
+delta_geom_max_f = float(delta_geom_max.detach().cpu().item())
+
 print(f"[Limits] max_dk_dt    = {max_dk_dt:.4f} [1/(m*s)]")
 print(f"[Limits] max_d_delta  = {max_d_delta_geom:.4f} [rad/s] ({np.degrees(max_d_delta_geom):.1f} deg/s)")
 print(f"[Limits] limit_d_delta= {limit_d_delta:.4f} [rad/s] ({np.degrees(limit_d_delta):.1f} deg/s) (Reference)")
-print(f"[Limits] delta_geom_max={delta_geom_max:.4f} [rad] ({np.degrees(delta_geom_max):.1f} deg) (@ R={R_MIN}m)")
+print(f"[Limits] delta_geom_max={delta_geom_max_f:.4f} [rad] ({np.degrees(delta_geom_max_f):.1f} deg) (@ R={R_MIN}m)")
 print(f"[Limits] limit_delta  = {limit_delta:.4f} [rad] ({np.degrees(limit_delta):.1f} deg)")
 print(f"[Limits] limit_accel  = {limit_accel:.4f} [m/s^2]")
 
 action_min = np.array([-limit_accel, -limit_delta], dtype=np.float32)
-action_max = np.array([ limit_accel,  limit_delta], dtype=np.float32)
+action_max = np.array([limit_accel, limit_delta], dtype=np.float32)
 
 agent = PPOAgentBatched(
     obs_dim=obs_dim,
@@ -265,47 +251,8 @@ agent = PPOAgentBatched(
     action_max=action_max,
 )
 
-# STAGE3用
-# agent = PPOAgentBatched(
-#     obs_dim=obs_dim,
-#     action_dim=action_dim,
-#     num_envs=B,
-#     rollout_steps=64,      # そのまま
-#     lr=5e-5,               # 1e-4→5e-5（更新を半分に）
-#     gamma=0.99,
-#     lam=0.95,
-#     clip_eps=0.08,         # 0.1→0.08（更新幅を少し抑制）
-#     epochs=4,              # 5→4（過学習/崩壊を少し抑える）
-#     batch_size=512,        # 256→512（勾配ノイズ減らす）
-#     vf_coef=0.5,
-#     ent_coef=0.0005,       # 0.001→0.0005（探索を弱めて安定寄り）
-#     max_grad_norm=0.3,     # 0.5→0.3（スパイクで壊れるのを防ぐ）
-#     device=device,
-#     dtype=dtype,
-# )
-
-
 if CKPT_PATH is not None:
     load_checkpoint(agent, CKPT_PATH, device="cuda")
-
-
-# agent = PPOAgentBatched(
-#     obs_dim=obs_dim,
-#     action_dim=action_dim,
-#     num_envs=B,
-#     rollout_steps=64,      # とりあえずそのままでもOK（後で128に増やしても良い）
-#     lr=1e-4,               # 3e-4 -> 1e-4 に下げて一歩あたりをマイルドに
-#     gamma=0.99,            # そのままでOK
-#     lam=0.95,              # そのままでOK
-#     clip_eps=0.1,          # 0.2 -> 0.1 にして「大きな方針更新」を抑える
-#     epochs=5,              # 10 -> 5 にして過学習＆崩壊を少し抑制
-#     batch_size=256,        # 64*64=4096 サンプル / update なので 16 ミニバッチ
-#     vf_coef=0.5,           # そのままでOK
-#     ent_coef=0.001,        # 0.01 はやや強めなので少し弱める（安定寄り）
-#     max_grad_norm=0.5,     # そのままでOK（NaN対策にも効く）
-#     device=device,
-#     dtype=dtype,
-# )
 
 
 # ===== 評価用 env（小さめバッチ + 固定seed） =====
@@ -316,20 +263,20 @@ eval_ref_trajs = [
 ]
 
 # ---- eval_ref_trajs 作成直後に先頭4本を保存 ----
-for i,traj in enumerate(eval_ref_trajs[:4]):
+for i, traj in enumerate(eval_ref_trajs[:4]):
     save_ref_traj_plots(traj, i)
-
-
 
 eval_env = BatchedPathTrackingEnvFrenet(
     ref_trajs=eval_ref_trajs,
     vehicle_params=veh_params,
     reward_weights=weights,  # ← これを追加
+    kappa_preview_offsets=kappa_preview_offsets,
     max_steps=2000,
     device=device,
     dtype=dtype,
 )
 eval_init_state = make_init_state(eval_ref_trajs, device, dtype)
+
 
 @torch.no_grad()
 def evaluate_policy(
@@ -367,7 +314,6 @@ def evaluate_policy(
         ts_delta_geom_hist = [[] for _ in range(num_xy_envs)]
         ts_s_hist = [[] for _ in range(num_xy_envs)]
 
-
     ep_returns = []
     ep_lengths = []
     ep_ey_mean = []
@@ -382,7 +328,7 @@ def evaluate_policy(
     ep_cost_ddelta_ref_mean = []
 
     for ep in range(num_episodes):
-        obs, state = env.reset(init_state, is_perturbed=False)
+        obs, _, state = env.reset(init_state, is_perturbed=False)  # ★ reset は (obs_norm, obs_raw, state)
         done = torch.zeros(B_eval, dtype=torch.bool, device=env.device)
 
         ep_ret = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
@@ -403,7 +349,7 @@ def evaluate_policy(
 
         for t in range(max_steps):
             actions, log_probs, values = agent.act_batch(obs)
-            next_obs, state, reward, done_step, info = env.step(
+            next_obs, next_obs_raw, next_state, reward, done_step, info = env.step(
                 actions, compute_info=True
             )
 
@@ -416,14 +362,16 @@ def evaluate_policy(
             ep_len[not_done] += 1
 
             # 誤差
-            ey = obs[:, 0]        # e_y
-            epsi = obs[:, 1]      # e_psi_v
-            v = obs[:, 2]         # v [m/s]
-            a_long = obs[:, 3]    # 縦加速度 a_x
-            delta = obs[:, 4]     # （環境実装により delta_ref の可能性あり）
+            ey = next_obs_raw[:, 0]        # e_y
+            epsi = next_obs_raw[:, 1]      # e_psi_v
+            v = next_obs_raw[:, 2]         # v [m/s]
+            a_long = next_obs_raw[:, 3]    # 縦加速度 a_x
             v_ref_now = info["v_ref"]      # (B,)
             a_lat = info["a_y"]            # (B,) 横加速度 a_y
             s = info["s"]
+
+            # ★ 舵角は obs_raw の index ではなく vehicle.state から取る（obs構成変更に強い）
+            delta = env.vehicle.state[:, 5]  # actual delta [rad]
 
             dv = (v - v_ref_now).abs()
 
@@ -443,7 +391,6 @@ def evaluate_policy(
             cost_ay_sum[not_done] += cost_ay[not_done]
 
             # ★追加：d_delta_ref 誤差（|d_delta_ref|）とコスト
-            # env が info に入れている想定（無い場合は actions からフォールバック）
             if "d_delta_ref" in info:
                 d_delta_ref = info["d_delta_ref"]
             else:
@@ -484,7 +431,7 @@ def evaluate_policy(
 
             # partial reset で数値安定（ただし done は維持）
             if use_partial_reset and done_step.any():
-                obs, _ = env.partial_reset(
+                obs, _, _ = env.partial_reset(
                     init_state=init_state,
                     done_mask=done_step,
                     is_perturbed=False,
@@ -621,7 +568,7 @@ def evaluate_policy(
                 axes[3].plot(t_axis, delta_geom_deg, label="delta_geom [deg]")
 
             axes[3].set_ylabel("Steering")
-            axes[3].set_ylim(-0.5,0.5)
+            axes[3].set_ylim(-0.5, 0.5)
             axes[3].grid(True)
             axes[3].legend(loc="upper right")
 
@@ -657,7 +604,7 @@ def evaluate_policy(
 
 
 # ===== 学習ループ =====
-num_updates = 3
+num_updates = 1000
 eval_interval = 10
 plot_env_idx = 0  # プロットする env index（学習環境側）
 
@@ -674,7 +621,9 @@ for update in range(num_updates):
 
         for t in range(agent.rollout_steps):
             actions, log_probs, values = agent.act_batch(obs_t)
-            next_obs, state, reward, done_step, info = train_env.step(actions, compute_info=False)
+            next_obs, next_obs_raw, next_state, reward, done_step, info = train_env.step(
+                actions, compute_info=False
+            )
 
             agent.store_step(
                 obs_batch=obs_t,
@@ -685,14 +634,9 @@ for update in range(num_updates):
                 log_probs=log_probs,
             )
 
-            # # x-y ログ
-            # if log_xy:
-            #     x_hist.append(train_env.vehicle.state[plot_env_idx, 0].item())
-            #     y_hist.append(train_env.vehicle.state[plot_env_idx, 1].item())
-
             # partial reset
             if done_step.any():
-                obs_t, _ = train_env.partial_reset(
+                obs_t, _, _ = train_env.partial_reset(
                     init_state=init_state,
                     done_mask=done_step,
                     is_perturbed=is_perturbed,
@@ -705,7 +649,6 @@ for update in range(num_updates):
         agent.update(last_obs=obs_t, last_done=done_step)
         obs = obs_t.detach()
 
-    
     # ===== 評価 =====
     if (update + 1) % eval_interval == 0:
         eval_stats = evaluate_policy(
