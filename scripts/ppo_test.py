@@ -116,6 +116,10 @@ device = "cuda"
 dtype = torch.float32
 is_perturbed = False
 
+# Trajectory Generation Params
+R_MIN = 100.0
+
+
 # # STAGE1
 # weights = RewardWeights(
 #     w_y=0.1,
@@ -162,7 +166,8 @@ def make_train_traj(seed=None):
         dt=dt,
         v_min_kph=40.0,
         v_max_kph=60.0,
-        R_min=100.0,
+        v_max_kph=60.0,
+        R_min=R_MIN,
         R_max=400.0,
         seed=None,   # reset ごとにランダム
     )
@@ -233,11 +238,17 @@ limit_d_delta = 2.0 * max_d_delta_geom
 limit_accel = 0.3 * 9.80665
 
 #    delta_ref limit -> max_steer (from vehicle params)
-limit_delta = veh_params.max_steer
+#    Proposed: 3 * steering_from_kappa(1/R_min)
+max_kappa = 1.0 / R_MIN
+delta_geom_max = train_env.vehicle.steering_from_kappa(torch.tensor(max_kappa))
+limit_delta = 3.0 * float(delta_geom_max)
+# Clamp to physical max steer just in case
+limit_delta = min(limit_delta, veh_params.max_steer)
 
 print(f"[Limits] max_dk_dt    = {max_dk_dt:.4f} [1/(m*s)]")
 print(f"[Limits] max_d_delta  = {max_d_delta_geom:.4f} [rad/s] ({np.degrees(max_d_delta_geom):.1f} deg/s)")
 print(f"[Limits] limit_d_delta= {limit_d_delta:.4f} [rad/s] ({np.degrees(limit_d_delta):.1f} deg/s) (Reference)")
+print(f"[Limits] delta_geom_max={delta_geom_max:.4f} [rad] ({np.degrees(delta_geom_max):.1f} deg) (@ R={R_MIN}m)")
 print(f"[Limits] limit_delta  = {limit_delta:.4f} [rad] ({np.degrees(limit_delta):.1f} deg)")
 print(f"[Limits] limit_accel  = {limit_accel:.4f} [m/s^2]")
 
