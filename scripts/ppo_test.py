@@ -16,6 +16,7 @@ EVAL_MODE = False
 CKPT_PATH = None
 # CKPT_PATH = "./checkpoints/20251219_020201_update0200.pt"
 # CKPT_PATH = "./checkpoints/20251219_032229_update0050.pt"
+# CKPT_PATH = "./checkpoints/20251223_031641_update0250.pt"
 
 # ===== 実行ごとの一意な ID（学習開始時刻） =====
 RUN_ID = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -127,12 +128,14 @@ weights = RewardWeights(
     w_v_under=0.1,
     w_v_over=1.5,
     w_ay=0.001,
-    w_d_delta_ref=.1,
+    w_d_delta_ref=10.,
+    w_dd_delta_ref = .001,
     loss_y="l2",
     loss_psi="l2",
     loss_v="l2",
     loss_ay="l2",
     loss_d_delta_ref="l2",
+    loss_dd_delta_ref = "l2",
 )
 
 veh_params = VehicleParams()
@@ -311,6 +314,7 @@ def evaluate_policy(
         ts_epsi_hist = [[] for _ in range(num_xy_envs)]
         # ★追加：d_delta_ref（ステア指令レート）
         ts_ddelta_ref_hist = [[] for _ in range(num_xy_envs)]
+        ts_dd_delta_ref_hist = [[] for _ in range(num_xy_envs)]
         ts_delta_geom_hist = [[] for _ in range(num_xy_envs)]
         ts_s_hist = [[] for _ in range(num_xy_envs)]
 
@@ -326,6 +330,8 @@ def evaluate_policy(
     # ★追加：d_delta_ref の誤差（|d_delta_ref|）とコスト
     ep_ddelta_ref_mean = []
     ep_cost_ddelta_ref_mean = []
+    ep_dd_delta_ref_mean = []
+    ep_cost_dd_delta_ref_mean = []
 
     for ep in range(num_episodes):
         obs, _, state = env.reset(init_state, is_perturbed=False)  # ★ reset は (obs_norm, obs_raw, state)
@@ -346,6 +352,8 @@ def evaluate_policy(
         # ★追加
         ddelta_ref_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
         cost_ddelta_ref_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
+        dd_delta_ref_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
+        cost_dd_delta_ref_sum = torch.zeros(B_eval, dtype=torch.float32, device=env.device)
 
         for t in range(max_steps):
             actions, log_probs, values = agent.act_batch(obs)
@@ -400,8 +408,21 @@ def evaluate_policy(
             else:
                 cost_d_delta_ref = torch.zeros_like(reward)
 
+            # ★追加：dd_delta_ref (jerk)
+            if "dd_delta_ref" in info:
+                dd_delta_ref = info["dd_delta_ref"]
+            else:
+                dd_delta_ref = torch.zeros_like(reward)
+            
+            if "cost_dd_delta_ref" in info:
+                cost_dd_delta_ref = info["cost_dd_delta_ref"]
+            else:
+                cost_dd_delta_ref = torch.zeros_like(reward)
+
             ddelta_ref_sum[not_done] += d_delta_ref[not_done].abs()
             cost_ddelta_ref_sum[not_done] += cost_d_delta_ref[not_done]
+            dd_delta_ref_sum[not_done] += dd_delta_ref[not_done].abs()
+            cost_dd_delta_ref_sum[not_done] += cost_dd_delta_ref[not_done]
 
             # ---- XY & 時系列ログ（ep==0 のときだけ & その env がまだ初回エピソード未完了なら）----
             if save_xy and ep == 0:
@@ -423,6 +444,7 @@ def evaluate_policy(
                         ts_epsi_hist[b].append(epsi[b].item())
                         # ★追加
                         ts_ddelta_ref_hist[b].append(d_delta_ref[b].item())
+                        ts_dd_delta_ref_hist[b].append(dd_delta_ref[b].item())
                         if delta_geom is not None:
                             ts_delta_geom_hist[b].append(delta_geom[b].item())
                         ts_s_hist[b].append(info["s"][b].item())
@@ -460,6 +482,9 @@ def evaluate_policy(
 
         ep_ddelta_ref_mean.append((ddelta_ref_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
         ep_cost_ddelta_ref_mean.append((cost_ddelta_ref_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+        
+        ep_dd_delta_ref_mean.append((dd_delta_ref_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
+        ep_cost_dd_delta_ref_mean.append((cost_dd_delta_ref_sum[mask_valid] / ep_len[mask_valid].float()).cpu())
 
     # ---- 集計 ----
     ep_returns = torch.cat(ep_returns)
@@ -474,6 +499,9 @@ def evaluate_policy(
 
     ep_ddelta_ref_mean = torch.cat(ep_ddelta_ref_mean)
     ep_cost_ddelta_ref_mean = torch.cat(ep_cost_ddelta_ref_mean)
+    
+    ep_dd_delta_ref_mean = torch.cat(ep_dd_delta_ref_mean)
+    ep_cost_dd_delta_ref_mean = torch.cat(ep_cost_dd_delta_ref_mean)
 
     ep_return_per_step = ep_returns / ep_lengths.float()
 
@@ -493,6 +521,8 @@ def evaluate_policy(
         # ★追加：d_delta_ref の“誤差”とコスト
         "d_delta_ref_abs_mean": ep_ddelta_ref_mean.mean().item(),
         "cost_d_delta_ref_mean": ep_cost_ddelta_ref_mean.mean().item(),
+        "dd_delta_ref_abs_mean": ep_dd_delta_ref_mean.mean().item(),
+        "cost_dd_delta_ref_mean": ep_cost_dd_delta_ref_mean.mean().item(),
     }
 
     # ---- XY プロット保存（4 走行を1画像に） + 時系列プロット ----
@@ -535,10 +565,10 @@ def evaluate_policy(
             if T == 0:
                 continue
             t_axis = ts_s_hist[i]  # ← s 軸
-
-            # ★ 7 段プロット: v, a_x, a_y, delta, e_y, e_psi_v, d_delta_ref
-            fig, axes = plt.subplots(7, 1, figsize=(10, 16), sharex=True)
-
+ 
+            # ★ 8 段プロット: v, a_x, a_y, delta, e_y, e_psi_v, d_delta_ref, dd_delta_ref
+            fig, axes = plt.subplots(8, 1, figsize=(10, 18), sharex=True)
+ 
             # 1) 車速 & 目標車速
             axes[0].plot(t_axis, ts_v_hist[i], label="v [m/s]")
             axes[0].plot(t_axis, ts_vref_hist[i], label="v_ref [m/s]")
@@ -591,6 +621,14 @@ def evaluate_policy(
             axes[6].set_ylabel("d_delta_ref")
             axes[6].grid(True)
             axes[6].legend(loc="upper right")
+
+            # ★8) dd_delta_ref（jerk）
+            dddelta_deg_s2 = [math.degrees(d) for d in ts_dd_delta_ref_hist[i]]
+            axes[7].plot(t_axis, dddelta_deg_s2, label="dd_delta_ref [deg/s^2]")
+            axes[7].set_xlabel("time [s]")
+            axes[7].set_ylabel("jerk")
+            axes[7].grid(True)
+            axes[7].legend(loc="upper right")
 
             fig.suptitle(f"Eval time-series (env {i})")
             plt.tight_layout()
@@ -676,6 +714,7 @@ for update in range(num_updates):
         print(f"  mean cost_v          : {eval_stats['cost_v_mean']:.6f}")
         print(f"  mean cost_ay         : {eval_stats['cost_ay_mean']:.6f}")
         print(f"  mean cost_d_delta_ref: {eval_stats['cost_d_delta_ref_mean']:.6f}")
+        print(f"  mean cost_dd_delta_ref: {eval_stats['cost_dd_delta_ref_mean']:.6f}")
         print(f"==============================\n")
 
         if EVAL_MODE:

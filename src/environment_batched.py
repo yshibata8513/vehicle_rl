@@ -19,12 +19,14 @@ class RewardWeights:
     w_v_over: float = 1.5    # 目標より速いとき
     w_ay: float = 0.001      # 横加速度
     w_d_delta_ref: float = 0.1  # ステア指令レート d_delta_ref の L2 ペナルティ
+    w_dd_delta_ref: float = 0.0  # jerk（d_delta_ref の変化）のペナルティ（デフォルト0で挙動不変）
     # 損失タイプ ("l1" or "l2")
     loss_y: str = "l2"
     loss_psi: str = "l2"
     loss_v: str = "l2"
     loss_ay: str = "l2"
     loss_d_delta_ref: str = "l2"
+    loss_dd_delta_ref: str = "l2"
 
 
 # obs の列順（参考）
@@ -482,7 +484,15 @@ class BatchedPathTrackingEnvFrenet:
         d_delta_ref_applied = d_delta_ref_val
         cost_d_delta_ref = w.w_d_delta_ref * self._penalty(d_delta_ref_applied, w.loss_d_delta_ref)
 
-        total_cost = cost_y + cost_psi + cost_v + cost_ay + cost_d_delta_ref
+        # jerk（d_delta_ref の変化率）のペナルティ
+        if "dd_delta_ref" in self._cache:
+            dd_delta_ref_val = self._cache["dd_delta_ref"]
+        else:
+            dd_delta_ref_val = torch.zeros(B, device=self.device, dtype=self.dtype)
+        dd_delta_ref_applied = dd_delta_ref_val
+        cost_dd_delta_ref = w.w_dd_delta_ref * self._penalty(dd_delta_ref_applied, w.loss_dd_delta_ref)
+
+        total_cost = cost_y + cost_psi + cost_v + cost_ay + cost_d_delta_ref + cost_dd_delta_ref
         reward = -total_cost
 
         done_lateral = torch.abs(e_y) > self.max_lateral_error
@@ -498,12 +508,14 @@ class BatchedPathTrackingEnvFrenet:
                 "cost_v": cost_v,
                 "cost_ay": cost_ay,
                 "cost_d_delta_ref": cost_d_delta_ref,
+                "cost_dd_delta_ref": cost_dd_delta_ref,
                 "a_y": a_y,
                 "v_ref": v_ref_now,
                 "s": self.s.data.clone(),
                 "kappa0": kappa0,
                 "delta_geom": delta_geom,
                 "d_delta_ref": d_delta_ref_applied,
+                "dd_delta_ref": dd_delta_ref_applied,
                 "delta_ref": delta_ref,
                 "done_lateral": done_lateral,
                 "done_pathend": done_pathend,
@@ -557,6 +569,16 @@ class BatchedPathTrackingEnvFrenet:
         delta_ref_new = torch.clamp(action[:, 1], -p.max_steer, p.max_steer)
         d_delta_ref_val = (delta_ref_new - delta_ref_old) / self.dt
         self._cache["d_delta_ref"] = d_delta_ref_val
+
+        # 4.5 jerk（d_delta_ref の変化）を計算して cache に注入
+        # delta_ref_history: [0]=t, [1]=t-1, [2]=t-2 ...
+        # done跨ぎ対策: step_count < 3 の間は無効化（reset後の履歴不足/境界混入を防ぐ）
+        rate_now = (self.delta_ref_history[:, 0] - self.delta_ref_history[:, 1]) / self.dt
+        rate_prev = (self.delta_ref_history[:, 1] - self.delta_ref_history[:, 2]) / self.dt
+        dd_delta_ref_val = (rate_now - rate_prev) / self.dt
+        valid = (self.step_count >= 3).to(dtype=self.dtype)
+        dd_delta_ref_val = dd_delta_ref_val * valid
+        self._cache["dd_delta_ref"] = dd_delta_ref_val
 
         reward, done, info = self._compute_reward_done_info(
             action=action,
