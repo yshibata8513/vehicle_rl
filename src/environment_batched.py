@@ -33,14 +33,14 @@ OBS_KEYS = [
     "e_psi_v",
     "v",
     "a",
-    "delta_ref",
     "r",
-    "s",
     "v_ref",
-    "kappa_0",
-    "kappa_preview_1",
-    "kappa_preview_2",
-    "kappa_preview_3",
+    "delta_ref_hist_0", # Current
+    "delta_ref_hist_1", # -1 step
+    "delta_ref_hist_2", # -2 step
+    "delta_ref_hist_3", # -3 step
+    "delta_ref_hist_4", # -4 step
+    # kappa_preview x 21
 ]
 
 
@@ -68,7 +68,8 @@ class BatchedPathTrackingEnvFrenet:
     def __init__(
         self,
         ref_trajs: List[ReferenceTrajectory],
-        preview_distances: Sequence[float] = (10.0, 20.0, 30.0),
+        ref_trajs: List[ReferenceTrajectory],
+        kappa_preview_offsets: Optional[Sequence[float]] = None,
         vehicle_params: Optional[VehicleParams] = None,
         reward_weights: Optional[RewardWeights] = None,
         max_lateral_error: float = 5.0,
@@ -148,15 +149,21 @@ class BatchedPathTrackingEnvFrenet:
                 psi.tolist(), dtype=self.dtype, device=self.device
             )
 
-        # プレビュー距離も同様に
-        self.preview_distances = np.asarray(preview_distances, dtype=np.float64)
-        self.preview_dists = torch.tensor(
-            self.preview_distances.tolist(),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.P = self.preview_dists.shape[0]
-        assert self.P == 3, "今の OBS_KEYS は preview 3点前提になっています"
+        # プレビュー距離 (kappa用)
+        if kappa_preview_offsets is None:
+             # Default: 0 to 20m at 1m intervals
+            self.kappa_preview_offsets = torch.arange(21, device=self.device, dtype=self.dtype) * 1.0
+        else:
+            self.kappa_preview_offsets = torch.tensor(
+                kappa_preview_offsets,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        self.P = self.kappa_preview_offsets.shape[0]
+
+        # delta_ref history buffer: (B, 5)
+        # [0]: current, [1]: -1, [2]: -2, [3]: -3, [4]: -4
+        self.delta_ref_history = torch.zeros(self.B, 5, dtype=self.dtype, device=self.device)
 
         # （以下は元のコードと同じ）
         self.vehicle = BatchedDynamicBicycleModel(
@@ -326,7 +333,7 @@ class BatchedPathTrackingEnvFrenet:
         P = self.P
 
         # s_q: (B, P)
-        s_q = s.unsqueeze(1) + self.preview_dists.unsqueeze(0)
+        s_q = s.unsqueeze(1) + self.kappa_preview_offsets.unsqueeze(0)
         s_q = torch.clamp(s_q, self.s_ref[0], self.s_ref[-1] - 1e-6)
 
         # flatten して searchsorted
@@ -377,6 +384,9 @@ class BatchedPathTrackingEnvFrenet:
         # 車両状態リセット（(B,8)/(B,9) 互換）
         init_state_v = self._ensure_vehicle_init_state(init_state)
         self.vehicle.reset(init_state_v)
+        
+        # delta_ref history reset (Zero fill)
+        self.delta_ref_history.zero_()
 
         # s0 初期化
         if s0 is None:
@@ -461,6 +471,10 @@ class BatchedPathTrackingEnvFrenet:
         self.e_psi_v[idx] = 0.0
         self.step_count[idx] = 0
 
+        # delta_ref history reset for reset envs
+        self.delta_ref_history[idx] = 0.0
+
+
         # ノイズを入れるならここで
         if is_perturbed:
             # 横偏差ノイズ ±1m
@@ -501,32 +515,38 @@ class BatchedPathTrackingEnvFrenet:
 
         # 経路情報をバッチで補間
         v_ref_now = self._interp_matrix(self.s, self.v_ref_mat)
-        kappa0 = self._interp_matrix(self.s, self.kappa_ref_mat)
+        # kappa0 = self._interp_matrix(self.s, self.kappa_ref_mat) # compute via preview[0] if offset is 0
         kappa_preview = self._interp_matrix_preview(self.s, self.kappa_ref_mat)
+        
+        # kappa0 for internals (reward etc) - extract from preview if possible or recompute
+        # Assuming kappa_preview_offsets[0] == 0.0
+        if self.kappa_preview_offsets[0] == 0.0:
+            kappa0 = kappa_preview[:, 0]
+        else:
+             kappa0 = self._interp_matrix(self.s, self.kappa_ref_mat)
 
         # 速度ベクトル方向の偏差は e_psi_v として状態で保持
         e_y = self.e_y
         e_psi_v = self._wrap_angle(self.e_psi_v)
 
         # ---- obs / state ----
-        # obs: 経路情報を含む（delta ではなく delta_ref を観測に出す）
-        obs = torch.stack(
-            [
-                e_y,
-                e_psi_v,
-                v,
-                a,
-                delta_ref,
-                r,
-                self.s,
-                v_ref_now,
-                kappa0,
-                kappa_preview[:, 0],
-                kappa_preview[:, 1],
-                kappa_preview[:, 2],
-            ],
-            dim=1,
-        )  # (B, 12)
+        # obs: 
+        # removed: s, delta_ref(single), kappa0(single)
+        # added: delta_ref_history(5), kappa_preview(21)
+        
+        obs_list = [
+            e_y,
+            e_psi_v,
+            v,
+            a,
+            r,
+            v_ref_now,
+            self.delta_ref_history, # (B, 5)
+            kappa_preview,          # (B, P)
+        ]
+        obs = torch.cat([
+            x if x.dim() == 2 else x.unsqueeze(1) for x in obs_list
+        ], dim=1)  # (B, 6 + 5 + P)
 
         # state: 経路情報は落として beta を入れ、delta_ref も含める
         state = torch.stack(
@@ -681,7 +701,17 @@ class BatchedPathTrackingEnvFrenet:
 
         # 2. 車両ダイナミクス更新（バッチ）
         #    ここで vehicle.state[:, 8] が新しい delta_ref (action由来) に更新される
+        # 2. 車両ダイナミクス更新（バッチ）
+        #    ここで vehicle.state[:, 8] が新しい delta_ref (action由来) に更新される
         self.vehicle.step(action, self.dt)
+
+        # History Update: shift right (latest at 0)
+        # Shift: [0]->[1], [1]->[2], ... 
+        # New -> [0]
+        # self.delta_ref_history = torch.roll(self.delta_ref_history, shifts=1, dims=1) # roll wraps around
+        # Manual shift to be safe
+        self.delta_ref_history[:, 1:] = self.delta_ref_history[:, :-1].clone()
+        self.delta_ref_history[:, 0] = self.vehicle.state[:, 8]
 
         # 2. Frenet 状態更新
         v = self.vehicle.state[:, 3]   # (B,)
