@@ -226,19 +226,23 @@ max_d_delta_geom = calculate_max_d_delta_ref(
 )
 
 # 3. Set limits
-#    d_delta_ref needs margin -> 2.0x
+#    d_delta_ref needs margin -> 2.0x (For reference / checking)
 limit_d_delta = 2.0 * max_d_delta_geom
 
 #    a_ref limit -> 0.3G
 limit_accel = 0.3 * 9.80665
 
+#    delta_ref limit -> max_steer (from vehicle params)
+limit_delta = veh_params.max_steer
+
 print(f"[Limits] max_dk_dt    = {max_dk_dt:.4f} [1/(m*s)]")
 print(f"[Limits] max_d_delta  = {max_d_delta_geom:.4f} [rad/s] ({np.degrees(max_d_delta_geom):.1f} deg/s)")
-print(f"[Limits] limit_d_delta= {limit_d_delta:.4f} [rad/s] ({np.degrees(limit_d_delta):.1f} deg/s)")
+print(f"[Limits] limit_d_delta= {limit_d_delta:.4f} [rad/s] ({np.degrees(limit_d_delta):.1f} deg/s) (Reference)")
+print(f"[Limits] limit_delta  = {limit_delta:.4f} [rad] ({np.degrees(limit_delta):.1f} deg)")
 print(f"[Limits] limit_accel  = {limit_accel:.4f} [m/s^2]")
 
-action_min = np.array([-limit_accel, -limit_d_delta], dtype=np.float32)
-action_max = np.array([ limit_accel,  limit_d_delta], dtype=np.float32)
+action_min = np.array([-limit_accel, -limit_delta], dtype=np.float32)
+action_max = np.array([ limit_accel,  limit_delta], dtype=np.float32)
 
 agent = PPOAgentBatched(
     obs_dim=obs_dim,
@@ -642,7 +646,7 @@ def evaluate_policy(
 
 
 # ===== 学習ループ =====
-num_updates = 1000
+num_updates = 3
 eval_interval = 10
 plot_env_idx = 0  # プロットする env index（学習環境側）
 

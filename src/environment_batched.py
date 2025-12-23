@@ -607,10 +607,19 @@ class BatchedPathTrackingEnvFrenet:
         # cost_ay = w.w_ay * (a_y ** 2)
         cost_ay = w.w_ay * self._penalty(a_y, w.loss_ay)
 
-        # d_delta_ref（ステア指令レート）のペナルティ（適用値で計算）
-        action = action.to(device=self.device, dtype=self.dtype)
-        assert action.shape == (B, 2), f"action shape must be ({B},2), got {action.shape}"
-        d_delta_ref_applied = torch.clamp(action[:, 1], -p.max_steer_rate, p.max_steer_rate)
+        # d_delta_ref（ステア指令レート）のペナルティ
+        # step() 内で計算して cache に入れているはず
+        if "d_delta_ref" in self._cache:
+            d_delta_ref_val = self._cache["d_delta_ref"]
+        else:
+             # Fallback (should not happen in normal step flow)
+            d_delta_ref_val = torch.zeros(B, device=self.device, dtype=self.dtype)
+
+        # 必要なら clip する（前の実装に合わせるなら max_steer_rate でクリップ？）
+        # ここでは「実際に生じた変化率」に対してペナルティを掛ける運用にする
+        # d_delta_ref_applied = torch.clamp(d_delta_ref_val, -p.max_steer_rate, p.max_steer_rate)
+        d_delta_ref_applied = d_delta_ref_val
+        
         # cost_d_delta_ref = w.w_d_delta_ref * (d_delta_ref_applied ** 2)
         cost_d_delta_ref = w.w_d_delta_ref * self._penalty(d_delta_ref_applied, w.loss_d_delta_ref)
 
@@ -667,7 +676,11 @@ class BatchedPathTrackingEnvFrenet:
         assert action.shape[0] == self.B and action.shape[1] == 2, \
             f"action must be (B,2) with B={self.B}, got {action.shape}"
 
-        # 1. 車両ダイナミクス更新（バッチ）
+        # 1. 前回の delta_ref を確保
+        delta_ref_old = self.vehicle.state[:, 8].clone()
+
+        # 2. 車両ダイナミクス更新（バッチ）
+        #    ここで vehicle.state[:, 8] が新しい delta_ref (action由来) に更新される
         self.vehicle.step(action, self.dt)
 
         # 2. Frenet 状態更新
@@ -692,8 +705,18 @@ class BatchedPathTrackingEnvFrenet:
         # ステップ数カウント
         self.step_count += 1
 
-        # 3. obs/state を計算（内部キャッシュ更新）→ reward/done/info を計算
+        # 3. obs/state を計算（内部キャッシュ更新）
         obs, state = self._compute_obs_state()
+
+        # 4. d_delta_ref (変化率) を計算して cache に注入
+        # delta_ref_new = self.vehicle.state[:, 8]
+        # ロジックを変えないため、bicycle_model 内と同等の clamp を行う
+        p = self.vehicle.params
+        delta_ref_new = torch.clamp(action[:, 1], -p.max_steer, p.max_steer)
+        d_delta_ref_val = (delta_ref_new - delta_ref_old) / self.dt
+        self._cache["d_delta_ref"] = d_delta_ref_val
+
+        # 5. reward/done/info を計算
         reward, done, info = self._compute_reward_done_info(
             action=action,
             compute_info=compute_info,

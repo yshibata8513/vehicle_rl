@@ -17,8 +17,8 @@ class VehicleParams:
     Cf: float = 8.0e4      # 前輪コーナリングスティフネス [N/rad]
     Cr: float = 8.0e4      # 後輪コーナリングスティフネス [N/rad]
 
-    tau_a: float = 0.3     # 加速度アクチュエータ時定数 [s]
-    tau_delta: float = 0.3 # ステアアクチュエータ時定数 [s]
+    tau_a: float = 0.1     # 加速度アクチュエータ時定数 [s]
+    tau_delta: float = 0.1 # ステアアクチュエータ時定数 [s]
 
     max_steer_deg: float = 30.0        # 最大舵角 [deg]
     max_steer_rate_deg: float = 180.0  # 最大舵角指令レート [deg/s]
@@ -152,7 +152,11 @@ class BatchedDynamicBicycleModel(nn.Module):
 
         # --- 入力クリップ（ZOHで固定）---
         a_ref = torch.clamp(action[:, 0], p.min_accel, p.max_accel)
-        d_delta_ref = torch.clamp(action[:, 1], -p.max_steer_rate, p.max_steer_rate)
+        # action[1] is now delta_ref command, not rate
+        delta_ref_cmd = torch.clamp(action[:, 1], -p.max_steer, p.max_steer)
+
+        # Update state delta_ref immediately (ZOH)
+        self.state[:, 8] = delta_ref_cmd
 
         dt_total = float(dt)
         dt_int = float(self.dt_internal)
@@ -181,11 +185,7 @@ class BatchedDynamicBicycleModel(nn.Module):
             delta = self.state[:, 5]
             beta = self.state[:, 6]
             r = self.state[:, 7]
-            delta_ref = self.state[:, 8]
-
-            # --- delta_ref integrate (ZOH d_delta_ref) ---
-            delta_ref = delta_ref + d_delta_ref * h_t
-            delta_ref = torch.clamp(delta_ref, -p.max_steer, p.max_steer)
+            delta_ref = self.state[:, 8]  # Already updated
 
             # --- 1st order actuators ---
             a_dot = (a_ref - a) / p.tau_a
@@ -234,7 +234,7 @@ class BatchedDynamicBicycleModel(nn.Module):
             self.state[:, 5] = delta
             self.state[:, 6] = beta
             self.state[:, 7] = r
-            self.state[:, 8] = delta_ref
+            # delta_ref is constant within step
 
         # full substeps
         for _ in range(n_full):
