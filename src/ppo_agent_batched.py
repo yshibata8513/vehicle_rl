@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.distributions as D
+import numpy as np
+from typing import Optional
 
 
 class RolloutBufferBatched:
@@ -113,7 +115,14 @@ class RolloutBufferBatched:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int = 2, hidden_dim: int = 128):
+    def __init__(
+        self, 
+        obs_dim: int, 
+        action_dim: int = 2, 
+        hidden_dim: int = 128,
+        action_min: Optional[torch.Tensor] = None,
+        action_max: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
 
         self.body = nn.Sequential(
@@ -129,12 +138,30 @@ class ActorCritic(nn.Module):
 
         # value head
         self.v_head = nn.Linear(hidden_dim, 1)
+        
+        # Action scaling
+        if action_min is None:
+            # Default to no scaling [-1, 1] if not provided, or handle error
+            # Interpreted as "no limit" -> standard Tanh [-1, 1]
+            action_min = -torch.ones(action_dim)
+        if action_max is None:
+            action_max = torch.ones(action_dim)
+            
+        self.register_buffer("action_min", action_min)
+        self.register_buffer("action_max", action_max)
+        
+        # Pre-calculate scale and bias
+        # action = tanh(z) * scale + bias
+        # scale = (max - min) / 2
+        # bias = (max + min) / 2
+        self.register_buffer("action_scale", (self.action_max - self.action_min) / 2.0)
+        self.register_buffer("action_bias", (self.action_max + self.action_min) / 2.0)
 
     def forward(self, obs: torch.Tensor):
         """
         obs: (N, obs_dim)
         戻り:
-            dist : Normal(μ, σ) with shape (..., action_dim)
+            dist : Normal(μ, σ) (raw distribution of z, before squash)
             value: (N, 1)
         """
         h = self.body(obs)
@@ -144,17 +171,40 @@ class ActorCritic(nn.Module):
         value = self.v_head(h)           # (N, 1)
         return dist, value
 
-    def act(self, obs: torch.Tensor):
+    def act(self, obs: torch.Tensor, deterministic: bool = False):
         """
         obs: (N, obs_dim)
         戻り:
-            actions : (N, action_dim)
+            actions : (N, action_dim) scaled
             log_prob: (N, 1)
             value   : (N, 1)
         """
         dist, value = self.forward(obs)
-        action = dist.sample()                 # (N, action_dim)
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)  # (N,1)
+        
+        if deterministic:
+            z = dist.mean
+        else:
+            z = dist.rsample()
+
+        # Squashing
+        action_squashed = torch.tanh(z)
+        
+        # Scaling
+        action = action_squashed * self.action_scale + self.action_bias
+        
+        # Log prob (of action)
+        # log_prob(a) = log_prob(z) - log|det(da/dz)|
+        # da/dz = scale * (1 - tanh^2(z))
+        
+        log_prob_z = dist.log_prob(z)
+        
+        # log(1 - tanh^2(z)) = 2*(log(2) - z - softplus(-2z))
+        log_det_jacobian_tanh = 2.0 * (np.log(2.0) - z - nn.functional.softplus(-2.0 * z))
+        log_det_jacobian_scale = torch.log(self.action_scale)
+        
+        log_prob = log_prob_z - log_det_jacobian_tanh - log_det_jacobian_scale
+        log_prob = log_prob.sum(-1, keepdim=True)
+        
         return action, log_prob, value
 
 
@@ -183,6 +233,8 @@ class PPOAgentBatched:
         max_grad_norm: float = 0.5,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
+        action_min: Optional[np.ndarray] = None,
+        action_max: Optional[np.ndarray] = None,
     ):
         self.device = device
         self.dtype = dtype
@@ -201,7 +253,23 @@ class PPOAgentBatched:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
 
-        self.net = ActorCritic(obs_dim, action_dim).to(device)
+        # Prepare action limits tensors
+        if action_min is not None:
+            a_min_t = torch.as_tensor(action_min, dtype=dtype, device=device)
+        else:
+            a_min_t = None
+            
+        if action_max is not None:
+            a_max_t = torch.as_tensor(action_max, dtype=dtype, device=device)
+        else:
+            a_max_t = None
+
+        self.net = ActorCritic(
+            obs_dim, 
+            action_dim, 
+            action_min=a_min_t, 
+            action_max=a_max_t
+        ).to(device)
         self.optim = torch.optim.Adam(self.net.parameters(), lr=lr)
 
         self.buffer = RolloutBufferBatched(
@@ -224,7 +292,8 @@ class PPOAgentBatched:
         """
         assert obs_batch.dim() == 2 and obs_batch.size(1) == self.obs_dim
         obs_t = obs_batch.to(self.device, self.dtype)
-        actions, log_probs, values = self.net.act(obs_t)
+        # deterministic=False for training/collection
+        actions, log_probs, values = self.net.act(obs_t, deterministic=False)
         return actions, log_probs, values
 
     def store_step(
@@ -329,8 +398,38 @@ class PPOAgentBatched:
                 batch_advantages = advantages[batch_idx]  # (Mb,1)
 
                 dist, values = self.net.forward(batch_obs)
-                new_log_probs = dist.log_prob(batch_actions).sum(-1, keepdim=True)  # (Mb,1)
-                entropy = dist.entropy().sum(-1, keepdim=True)                      # (Mb,1)
+                
+                # --- Re-evaluate log_probs for Squashed Gaussian ---
+                # 1. Reverse scaling: a_scaled -> tanh(z)
+                #    action = tanh(z) * scale + bias
+                #    tanh(z) = (action - bias) / scale
+                action_scale = self.net.action_scale
+                action_bias = self.net.action_bias
+                
+                norm_action = (batch_actions - action_bias) / action_scale
+                # Clip to avoid NaNs at boundary (if actions slightly exceeded due to numerical errors)
+                norm_action = torch.clamp(norm_action, -0.999999, 0.999999)
+                
+                # 2. Reverse Tanh: tanh(z) -> z
+                #    z = atanh(norm_action)
+                z = torch.atanh(norm_action)
+                
+                # 3. Calculate log_prob(a)
+                #    log_prob(a) = log_prob(z) - log_det_jacobian
+                log_prob_z = dist.log_prob(z)  # uses Normal(mu, std)
+
+                # Jacobian correction
+                # log(1 - tanh(z)^2) + log(scale)
+                # We can reuse norm_action = tanh(z)
+                # 1 - tanh^2 = 1 - norm_action^2
+                log_det_jacobian_tanh = torch.log(1.0 - norm_action.pow(2) + 1e-6)
+                log_det_jacobian_scale = torch.log(action_scale) 
+                
+                new_log_probs = log_prob_z - log_det_jacobian_tanh - log_det_jacobian_scale
+                new_log_probs = new_log_probs.sum(-1, keepdim=True)  # (Mb, 1)
+
+                # Entropy: for now using base distribution entropy
+                entropy = dist.entropy().sum(-1, keepdim=True)       # (Mb, 1)
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
