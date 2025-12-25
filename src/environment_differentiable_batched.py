@@ -644,5 +644,219 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             obs_n = torch.clamp(obs_n, -float(clip), float(clip))
         return obs_n
 
+    # -----------------
+    # done mask / partial reset (PPO-like utilities)
+    # -----------------
+
+    @torch.no_grad()
+    def get_done_mask(self) -> torch.Tensor:
+        """Return current done mask (B,) based on internal state."""
+        done_lateral = torch.abs(self.e_y) > self.max_lateral_error
+        done_pathend = self.s >= self.s_end
+        done_steps = self.step_count >= self.max_steps
+        return done_lateral | done_pathend | done_steps
+
+    
+    def _regenerate_trajectories_for_indices(
+        self,
+        idx: torch.Tensor,
+        init_state: torch.Tensor,
+    ) -> None:
+        """Regenerate reference trajectories for selected batch indices.
+
+        Mirrors `environment_batched.py` behavior: replaces (v_ref_mat, kappa_ref_mat, psi_ref_mat)
+        and updates `init_state` to match the new trajectory start pose/speed.
+        """
+        if self.traj_generator is None:
+            return
+
+        s_ref_base = self.s_ref.detach().cpu().numpy()
+
+        for b in idx.tolist():
+            traj = self.traj_generator()
+
+            s_ref_new = np.asarray(traj.s_ref, dtype=np.float64)
+            if s_ref_new.shape[0] != self.Ns or not np.allclose(s_ref_new, s_ref_base):
+                raise ValueError(
+                    f"traj_generator produced s_ref of shape {s_ref_new.shape}, "
+                    "but env expects same s_ref as at init. "
+                    "total_length と ds を固定しているか確認してください。"
+                )
+
+            v_ref = torch.tensor(
+                np.asarray(traj.v_ref, dtype=np.float64).tolist(),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            kappa_ref = torch.tensor(
+                np.asarray(traj.kappa_ref, dtype=np.float64).tolist(),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.v_ref_mat[b] = v_ref
+            self.kappa_ref_mat[b] = kappa_ref
+
+            x_ref = np.asarray(traj.x_ref, dtype=np.float64)
+            y_ref = np.asarray(traj.y_ref, dtype=np.float64)
+            dx = np.diff(x_ref)
+            dy = np.diff(y_ref)
+            psi = np.arctan2(dy, dx)
+            if len(psi) > 0:
+                psi = np.concatenate([psi, psi[-1:]])
+            else:
+                psi = np.array([0.0], dtype=np.float64)
+
+            self.psi_ref_mat[b] = torch.tensor(psi.tolist(), dtype=self.dtype, device=self.device)
+
+            # update init_state to match new trajectory start
+            x0 = float(x_ref[0])
+            y0 = float(y_ref[0])
+            psi0 = float(psi[0])
+            v0 = float(traj.v_ref[0])
+
+            init_state[b, 0] = x0
+            init_state[b, 1] = y0
+            init_state[b, 2] = psi0
+            init_state[b, 3] = v0
+            init_state[b, 4:] = 0.0
+
+        # trajectory swap => rebuild normalizer cache next time
+        if hasattr(self, "_obs_norm_mid"):
+            delattr(self, "_obs_norm_mid")
+        if hasattr(self, "_obs_norm_scale"):
+            delattr(self, "_obs_norm_scale")
 
 
+    def functional_partial_reset(
+        self,
+        env_state: BatchedFrenetEnvState,
+        init_state: torch.Tensor,
+        done_mask: torch.Tensor,
+        *,
+        is_perturbed: bool = True,
+        regenerate_traj: bool = False,
+        normalize_obs: bool = True,
+        obs_clip: float = 5.0,
+    ) -> Tuple[BatchedFrenetEnvState, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Functional partial reset (works on an explicit env_state).
+
+        Used during differentiable rollouts: replaces only done indices, returns updated env_state
+        plus (obs_norm, obs_raw, state_vec).
+        """
+        device, dtype = self.device, self.dtype
+
+        if done_mask.dim() == 2 and done_mask.shape[1] == 1:
+            done_mask = done_mask.squeeze(1)
+        if done_mask.dim() != 1 or done_mask.shape[0] != self.B:
+            raise ValueError(f"done_mask must be (B,) or (B,1), got {tuple(done_mask.shape)} with B={self.B}")
+        done_mask = done_mask.to(device=device)
+
+        idx = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            obs_raw, state_vec, cache = self.compute_obs_state(env_state, return_cache=True)
+            self._cache = cache
+            obs_norm = self.normalize_obs(obs_raw, clip=float(obs_clip)) if normalize_obs else obs_raw
+            return env_state, obs_norm, obs_raw, state_vec
+
+        if regenerate_traj and self.traj_generator is not None:
+            self._regenerate_trajectories_for_indices(idx, init_state)
+
+        init_state_v = self._ensure_vehicle_init_state(init_state)
+
+        vehicle_state = env_state.vehicle_state.clone()
+        vehicle_state[idx] = init_state_v[idx].to(device=device, dtype=dtype)
+
+        s = env_state.s.clone()
+        s0_val = float(self.s_ref[0])
+        s[idx] = s0_val
+
+        e_y = env_state.e_y.clone()
+        e_psi_v = env_state.e_psi_v.clone()
+        e_y[idx] = 0.0
+        e_psi_v[idx] = 0.0
+
+        step_count = env_state.step_count.clone()
+        step_count[idx] = 0
+
+        delta_ref_history = env_state.delta_ref_history.clone()
+        delta_ref_history[idx] = 0.0
+
+        if is_perturbed:
+            e_y[idx] += (torch.rand(idx.numel(), device=device) * 2.0 - 1.0)
+
+            dv_max = 10.0 / 3.6
+            dv = (torch.rand(idx.numel(), device=device) * 2.0 - 1.0) * dv_max
+            v = vehicle_state[idx, 3] + dv
+            vehicle_state[idx, 3] = torch.clamp(v, min=0.0)
+
+            dpsi_max = torch.tensor(10.0 / 180.0 * 3.141592653589793, device=device)
+            dpsi = (torch.rand(idx.numel(), device=device) * 2.0 - 1.0) * dpsi_max
+            e_psi_v[idx] += dpsi
+
+        next_env_state = BatchedFrenetEnvState(
+            vehicle_state=vehicle_state,
+            s=s,
+            e_y=e_y,
+            e_psi_v=e_psi_v,
+            step_count=step_count,
+            delta_ref_history=delta_ref_history,
+        )
+
+        obs_raw, state_vec, cache = self.compute_obs_state(next_env_state, return_cache=True)
+        self._cache = cache
+        obs_norm = self.normalize_obs(obs_raw, clip=float(obs_clip)) if normalize_obs else obs_raw
+        return next_env_state, obs_norm, obs_raw, state_vec
+
+
+    @torch.no_grad()
+    def partial_reset(
+        self,
+        init_state: torch.Tensor,
+        done_mask: torch.Tensor,
+        is_perturbed: bool = False,
+        regenerate_traj: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stateful partial reset (PPO-like utility)."""
+        device, dtype = self.device, self.dtype
+        done_mask = done_mask.to(device=device)
+
+        idx = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            env_state = self.get_env_state()
+            obs_raw, state_vec, cache = self.compute_obs_state(env_state, return_cache=True)
+            self._cache = cache
+            obs_norm = self.normalize_obs(obs_raw, clip=5.0)
+            return obs_norm, obs_raw, state_vec
+
+        if regenerate_traj and self.traj_generator is not None:
+            self._regenerate_trajectories_for_indices(idx, init_state)
+
+        init_state_v = self._ensure_vehicle_init_state(init_state)
+        self.vehicle.state[idx] = init_state_v[idx].to(device=device, dtype=dtype)
+
+        s0_val = float(self.s_ref[0])
+        self.s[idx] = s0_val
+
+        self.e_y[idx] = 0.0
+        self.e_psi_v[idx] = 0.0
+        self.step_count[idx] = 0
+
+        self.delta_ref_history[idx] = 0.0
+
+        if is_perturbed:
+            self.e_y[idx] += (torch.rand(idx.numel(), device=device) * 2.0 - 1.0)
+
+            dv_max = 10.0 / 3.6
+            dv = (torch.rand(idx.numel(), device=device) * 2.0 - 1.0) * dv_max
+            v = self.vehicle.state[idx, 3] + dv
+            self.vehicle.state[idx, 3] = torch.clamp(v, min=0.0)
+
+            dpsi_max = torch.tensor(10.0 / 180.0 * 3.141592653589793, device=device)
+            dpsi = (torch.rand(idx.numel(), device=device) * 2.0 - 1.0) * dpsi_max
+            self.e_psi_v[idx] += dpsi
+
+        env_state = self.get_env_state()
+        obs_raw, state_vec, cache = self.compute_obs_state(env_state, return_cache=True)
+        self._cache = cache
+        obs_norm = self.normalize_obs(obs_raw, clip=5.0)
+        return obs_norm, obs_raw, state_vec

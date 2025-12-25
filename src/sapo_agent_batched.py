@@ -346,6 +346,23 @@ class SAPOAgentBatched:
                 reward_t = reward_t.unsqueeze(-1)
             if done_t.dim() == 1:
                 done_t = done_t.unsqueeze(-1)
+            # PPO (ppo_test.py) と同様: done になった要素は新しい軌道で partial reset して継続する
+            if bool(done_t.any().detach().cpu().item()):
+                init_state = getattr(self, "init_state", None)
+                if (init_state is not None) and hasattr(env, "functional_partial_reset"):
+                    done_mask = done_t.detach().squeeze(-1)
+                    (env_state_next,
+                     obs_norm_next,
+                     _obs_raw_next,
+                     _state_vec_next) = env.functional_partial_reset(
+                        env_state_next,
+                        init_state,
+                        done_mask,
+                        is_perturbed=bool(getattr(self, "reset_is_perturbed", False)),
+                        regenerate_traj=bool(getattr(self, "regenerate_traj_on_done", True)),
+                        normalize_obs=True,
+                        obs_clip=5.0,
+                    )
 
             # actor objective terms (keep graph)
             rewards_g.append(reward_t)
