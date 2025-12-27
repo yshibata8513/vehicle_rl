@@ -407,10 +407,18 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         compute_info: bool = True,
         normalize_obs: bool = True,
         obs_clip: Optional[float] = 5.0,
-    ) -> Tuple[BatchedFrenetEnvState, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, Any]]]:
+    ) -> Tuple[
+        BatchedFrenetEnvState,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[Dict[str, Any]],
+    ]:
         """
         Pure transition:
-          (env_state, action) -> (next_env_state, obs_norm, obs_raw, state_vec, reward, done, info)
+        (env_state, action) -> (next_env_state, obs_norm, obs_raw, state_vec, reward, done, info)
         """
         if not (action.shape[0] == self.B and action.shape[1] == 2):
             raise ValueError(f"action must be (B,2) with B={self.B}, got {tuple(action.shape)}")
@@ -418,34 +426,74 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         dt = float(self.dt)
         dt_t = torch.as_tensor(dt, dtype=self.dtype, device=self.device)
 
-        # --- vehicle step (pure) ---
+        # --- vehicle + Frenet integration (pure) ---
         delta_ref_old = env_state.vehicle_state[:, 8]
-        next_vehicle_state, vinfo = self.vehicle.functional_step(env_state.vehicle_state, action, dt=dt, return_info=True)
-        F_yf = vinfo.get("F_yf", None)
-        F_yr = vinfo.get("F_yr", None)
+
+        dt_int = float(self.vehicle.dt_internal)
+        if dt_int <= 0.0:
+            raise ValueError(f"dt_internal must be > 0, got {dt_int}")
+
+        n_full = int(dt // dt_int)
+        dt_rem = dt - n_full * dt_int
+
+        veh = env_state.vehicle_state
+        s = env_state.s
+        e_y = env_state.e_y
+        e_psi_v = env_state.e_psi_v
+
+        F_yf = None
+        F_yr = None
+
+        def frenet_substep(
+            veh_state: torch.Tensor,
+            s: torch.Tensor,
+            e_y: torch.Tensor,
+            e_psi_v: torch.Tensor,
+            h: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            h_t = torch.as_tensor(h, dtype=self.dtype, device=self.device)
+
+            v = veh_state[:, 3]
+            beta = veh_state[:, 6]
+            r = veh_state[:, 7]
+
+            kappa0 = self._interp_matrix(s, self.kappa_ref_mat)
+
+            denom = 1.0 - kappa0 * e_y
+            denom = torch.clamp(denom, min=0.1)
+
+            # 速度ベクトルの向き (e_psi_v + beta) を見るべき
+            s_dot = v * torch.cos(e_psi_v + beta) / denom
+            e_y_dot = v * torch.sin(e_psi_v + beta)
+            e_psi_v_dot = r - kappa0 * s_dot
+
+            s = s + s_dot * h_t
+            e_y = e_y + e_y_dot * h_t
+            e_psi_v = self._wrap_angle(e_psi_v + e_psi_v_dot * h_t)
+            return s, e_y, e_psi_v
+
+        for _ in range(n_full):
+            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_int, return_info=True)
+            F_yf = vinfo.get("F_yf", None)
+            F_yr = vinfo.get("F_yr", None)
+            s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_int)
+
+        if dt_rem > 0.0:
+            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_rem, return_info=True)
+            F_yf = vinfo.get("F_yf", None)
+            F_yr = vinfo.get("F_yr", None)
+            s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_rem)
+
+        next_vehicle_state = veh
+        next_s = s
+        next_e_y = e_y
+        next_e_psi_v = e_psi_v
 
         # --- update delta_ref history (pure shift) ---
         next_delta_ref_history = torch.cat(
             [next_vehicle_state[:, 8:9], env_state.delta_ref_history[:, :-1]],
             dim=1,
         )
-
-        # --- update Frenet states ---
-        v = next_vehicle_state[:, 3]
-        r = next_vehicle_state[:, 7]
-
-        kappa0 = self._interp_matrix(env_state.s, self.kappa_ref_mat)
-
-        denom = 1.0 - kappa0 * env_state.e_y
-        denom = torch.clamp(denom, min=0.1)
-
-        s_dot = v * torch.cos(env_state.e_psi_v) / denom
-        e_y_dot = v * torch.sin(env_state.e_psi_v)
-        e_psi_v_dot = r - kappa0 * s_dot
-
-        next_s = env_state.s + s_dot * dt_t
-        next_e_y = env_state.e_y + e_y_dot * dt_t
-        next_e_psi_v = self._wrap_angle(env_state.e_psi_v + e_psi_v_dot * dt_t)
 
         next_step_count = env_state.step_count + 1
 
@@ -569,8 +617,6 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         # update stateful tensors
         self.set_env_state(next_state)
         # store cache for debug, not required for gradients
-        _, _, cache = self.compute_obs_state(next_state, return_cache=True)
-        self._cache = cache
         return obs_norm, obs_raw, state_vec, reward, done, info
 
     # -----------------
@@ -758,8 +804,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             obs_norm = self.normalize_obs(obs_raw, clip=float(obs_clip)) if normalize_obs else obs_raw
             return env_state, obs_norm, obs_raw, state_vec
 
-        if regenerate_traj and self.traj_generator is not None:
-            self._regenerate_trajectories_for_indices(idx, init_state)
+        self._regenerate_trajectories_for_indices(idx, init_state)
 
         init_state_v = self._ensure_vehicle_init_state(init_state)
 

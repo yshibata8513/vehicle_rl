@@ -35,15 +35,19 @@ def generate_random_reference_trajectory_arc_mix(
     - 直線は kappa=0
     - 円弧は一定曲率 kappa = ±1/R, R ∈ [R_min, R_max]
     - その間を一定長さの線形曲率遷移（クロソイド風）でつなぐ
-    """
 
+    変更点:
+    - セグメントごとに目標速度 v_ref をふり直す。
+    - 「遷移セグメント」とそれに続く「一定曲率セグメント」は同じ曲率ターゲットを使う
+      （= 遷移の終端 κ と一定区間の κ が一致する。元実装の意図を明確化しつつ保持）。
+    """
     rng = np.random.default_rng(seed)
 
     # s グリッド
     n_points = int(total_length / ds) + 1
     s_ref = np.arange(n_points) * ds
 
-    # セグメントリスト: (seg_type, L_seg, kappa_start, kappa_end)
+    # セグメントリスト: (seg_type, L_seg, kappa_start, kappa_end, v_ms)
     # seg_type: "const" or "linear"
     segments = []
     prev_kappa = 0.0
@@ -56,10 +60,12 @@ def generate_random_reference_trajectory_arc_mix(
         # 残りが小さすぎるときは最後のセグメントに吸収
         if L_avail < seg_len_min * 0.5:
             if segments:
-                seg_type, L, ks, ke = segments[-1]
-                segments[-1] = (seg_type, L + L_avail, ks, ke)
+                seg_type, L, ks, ke, v_ms = segments[-1]
+                segments[-1] = (seg_type, L + L_avail, ks, ke, v_ms)
             else:
-                segments.append(("const", L_avail, 0.0, 0.0))
+                v_kph = rng.uniform(v_min_kph, v_max_kph)
+                v_ms = v_kph / 3.6
+                segments.append(("const", L_avail, 0.0, 0.0, v_ms))
             s_accum = total_length
             break
 
@@ -92,20 +98,25 @@ def generate_random_reference_trajectory_arc_mix(
         if L_const + L_tr > L_avail:
             L_const = max(seg_len_min * 0.5, L_avail - L_tr)
 
-        # 遷移セグメント（線形に κ を変化）
+        # セグメントごとの速度をサンプル（遷移+一定曲率で同一速度）
+        v_kph = rng.uniform(v_min_kph, v_max_kph)
+        v_ms = v_kph / 3.6
+
+        # 遷移セグメント（線形に κ を変化）: 終端は kappa_target
         if L_tr > 1e-6 and abs(kappa_target - prev_kappa) > 1e-6:
-            segments.append(("linear", L_tr, prev_kappa, kappa_target))
+            segments.append(("linear", L_tr, prev_kappa, kappa_target, v_ms))
             s_accum += L_tr
 
-        # 一定曲率セグメント
-        segments.append(("const", L_const, kappa_target, kappa_target))
+        # 一定曲率セグメント: κ は遷移終端と同じ kappa_target
+        segments.append(("const", L_const, kappa_target, kappa_target, v_ms))
         s_accum += L_const
         prev_kappa = kappa_target
 
     # -------------------------------------------------
-    # κ(s) を s_ref 上にサンプリング
+    # κ(s), v(s) を s_ref 上にサンプリング
     # -------------------------------------------------
     kappa_ref = np.zeros_like(s_ref)
+    v_ref = np.zeros_like(s_ref)
     seg_idx = 0
     seg_s = 0.0  # 現在のセグメント内の s
 
@@ -117,8 +128,9 @@ def generate_random_reference_trajectory_arc_mix(
 
         if seg_idx >= len(segments):
             kappa = prev_kappa
+            v_ms = segments[-1][4] if segments else (rng.uniform(v_min_kph, v_max_kph) / 3.6)
         else:
-            seg_type, L_seg, ks, ke = segments[seg_idx]
+            seg_type, L_seg, ks, ke, v_ms = segments[seg_idx]
             if L_seg <= 0:
                 kappa = ke
             elif seg_type == "const":
@@ -128,6 +140,7 @@ def generate_random_reference_trajectory_arc_mix(
                 kappa = ks + (ke - ks) * ratio
 
         kappa_ref[i] = kappa
+        v_ref[i] = v_ms
         seg_s += ds
 
     # -------------------------------------------------
@@ -141,13 +154,6 @@ def generate_random_reference_trajectory_arc_mix(
         psi[i] = psi[i - 1] + kappa_ref[i - 1] * ds
         x_ref[i] = x_ref[i - 1] + np.cos(psi[i - 1]) * ds
         y_ref[i] = y_ref[i - 1] + np.sin(psi[i - 1]) * ds
-
-    # -------------------------------------------------
-    # 目標速度プロファイル（区間全体で一定、20〜60 km/h のランダム）
-    # -------------------------------------------------
-    v_kph = rng.uniform(v_min_kph, v_max_kph)
-    v_ms = v_kph / 3.6
-    v_ref = np.full_like(s_ref, v_ms)
 
     return ReferenceTrajectory(
         s_ref=s_ref,

@@ -448,11 +448,6 @@ class SAPOAgentBatched:
                 x = buf
             else:
                 x = torch.stack(buf, dim=0)
-            # Fix (B,H,...) -> (H,B,...) if needed
-            if x.dim() >= 2 and x.shape[0] == self.num_envs and x.shape[1] == H:
-                x = x.transpose(0, 1)
-            elif x.dim() >= 2 and x.shape[0] != H and x.shape[1] == H:
-                x = x.transpose(0, 1)
             # Ensure scalar sequences have shape (H,B,1)
             if x.dim() == 2:
                 x = x.unsqueeze(-1)
