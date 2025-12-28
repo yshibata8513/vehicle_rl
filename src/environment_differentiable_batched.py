@@ -35,6 +35,13 @@ class RewardWeights:
     w_d_delta_ref: float = 0.01
     w_dd_delta_ref: float = 0.005
 
+
+    # curvature tracking
+    w_kappa: float = 0.0
+
+    # tire saturation (slip angle excess)
+    w_tire_alpha_excess: float = 0.0
+    tire_util_threshold: float = 0.8
     # loss type: "l1" or "l2"
     loss_y: str = "l2"
     loss_psi: str = "l2"
@@ -44,6 +51,8 @@ class RewardWeights:
     loss_dd_delta_ref: str = "l2"
 
 
+    loss_kappa: str = "l2"
+    loss_tire_alpha_excess: str = "l2"
 # =========================
 #  Differentiable env state container
 # =========================
@@ -314,6 +323,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         dd_delta_ref: Optional[torch.Tensor] = None,
         F_yf: Optional[torch.Tensor] = None,
         F_yr: Optional[torch.Tensor] = None,
+        alpha_f: Optional[torch.Tensor] = None,
+        alpha_r: Optional[torch.Tensor] = None,
         compute_info: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, Any]]]:
         """
@@ -346,22 +357,32 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         cost_v = torch.where(v <= v_ref_now, cost_v_under, cost_v_over)
 
         # lateral acceleration from tire forces
-        if F_yf is None or F_yr is None:
-            # fallback: use vehicle buffers if stateful mode used
-            F_yf = getattr(self.vehicle, "F_yf", torch.zeros_like(v))
-            F_yr = getattr(self.vehicle, "F_yr", torch.zeros_like(v))
-        a_y = (F_yf + F_yr) / p.m
+        F_yf_use = self.vehicle.F_yf if F_yf is None else F_yf
+        F_yr_use = self.vehicle.F_yr if F_yr is None else F_yr
+        a_y = (F_yf_use + F_yr_use) / p.m
         cost_ay = w.w_ay * self._penalty(a_y, w.loss_ay)
 
-        if d_delta_ref is None:
-            d_delta_ref = torch.zeros_like(v)
-        if dd_delta_ref is None:
-            dd_delta_ref = torch.zeros_like(v)
 
         cost_d_delta_ref = w.w_d_delta_ref * self._penalty(d_delta_ref, w.loss_d_delta_ref)
         cost_dd_delta_ref = w.w_dd_delta_ref * self._penalty(dd_delta_ref, w.loss_dd_delta_ref)
+        # curvature tracking (path curvature from lateral accel)
+        v_eff = torch.clamp(v, min=float(getattr(self.vehicle, 'v_eff_min', 1e-3)))
+        v_kappa = torch.clamp(v, min=1e-3)
+        kappa_hat = a_y / (v_eff * v_kappa)
+        e_kappa = kappa_hat - kappa0
+        cost_kappa = w.w_kappa * self._penalty(e_kappa, w.loss_kappa)
 
-        total_cost = cost_y + cost_psi + cost_v + cost_ay + cost_d_delta_ref + cost_dd_delta_ref
+        alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = self.vehicle.tire_alpha_excess_from_alphas(
+            alpha_f=alpha_f,
+            alpha_r=alpha_r,
+            util_threshold=float(getattr(w, 'tire_util_threshold', 0.8)),
+        )
+        cost_tire_alpha_excess = w.w_tire_alpha_excess * (
+            self._penalty(alpha_excess_f, w.loss_tire_alpha_excess)
+            + self._penalty(alpha_excess_r, w.loss_tire_alpha_excess)
+        )
+
+        total_cost = cost_y + cost_psi + cost_v + cost_ay + cost_d_delta_ref + cost_dd_delta_ref + cost_kappa + cost_tire_alpha_excess
         reward = -total_cost
 
         done_lateral = torch.abs(e_y) > self.max_lateral_error
@@ -378,6 +399,12 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 "cost_ay": cost_ay,
                 "cost_d_delta_ref": cost_d_delta_ref,
                 "cost_dd_delta_ref": cost_dd_delta_ref,
+                "cost_kappa": cost_kappa,
+                "cost_tire_alpha_excess": cost_tire_alpha_excess,
+                "alpha_f": alpha_f,
+                "alpha_r": alpha_r,
+                "kappa_hat": kappa_hat,
+                "e_kappa": e_kappa,
                 "a_y": a_y,
                 "v_ref": v_ref_now,
                 "s": env_state.s,
@@ -443,6 +470,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
 
         F_yf = None
         F_yr = None
+        alpha_f = None
+        alpha_r = None
 
         def frenet_substep(
             veh_state: torch.Tensor,
@@ -476,12 +505,16 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_int, return_info=True)
             F_yf = vinfo.get("F_yf", None)
             F_yr = vinfo.get("F_yr", None)
+            alpha_f = vinfo.get("alpha_f", None)
+            alpha_r = vinfo.get("alpha_r", None)
             s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_int)
 
         if dt_rem > 0.0:
             veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_rem, return_info=True)
             F_yf = vinfo.get("F_yf", None)
             F_yr = vinfo.get("F_yr", None)
+            alpha_f = vinfo.get("alpha_f", None)
+            alpha_r = vinfo.get("alpha_r", None)
             s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_rem)
 
         next_vehicle_state = veh
@@ -529,6 +562,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             dd_delta_ref=dd_delta_ref,
             F_yf=F_yf,
             F_yr=F_yr,
+            alpha_f=alpha_f,
+            alpha_r=alpha_r,
             compute_info=compute_info,
         )
 

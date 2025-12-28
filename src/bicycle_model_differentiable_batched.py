@@ -27,7 +27,7 @@ class VehicleParams:
     min_accel: float = -6.0            # max decel [m/s^2] (negative)
 
     # ---- tire force saturation (simple) ----
-    mu: float = 0.9        # friction coefficient
+    mu: float = 0.2        # friction coefficient
     g: float = 9.81        # gravity [m/s^2]
 
     @property
@@ -96,6 +96,43 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
     @property
     def batch_size(self) -> int:
         return int(self.state.shape[0])
+
+    def slip_angles(self, beta, r, v_eff, delta):
+        p = self.params
+        alpha_f = beta + p.lf * r / v_eff - delta
+        alpha_r = beta - p.lr * r / v_eff
+        return alpha_f, alpha_r
+
+    def tire_alpha_excess_from_alphas(
+        self,
+        alpha_f: torch.Tensor,
+        alpha_r: torch.Tensor,
+        *,
+        util_threshold: float = 0.8,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute slip-angle excess beyond the slip angle that corresponds to a given
+        tire utilization threshold (|Fy|/Fy_max = util_threshold) under the tanh model.
+
+        Returns:
+            alpha_excess_f, alpha_excess_r, alpha_th_f, alpha_th_r
+        """
+        p = self.params
+        u_th = float(util_threshold)
+        # keep atanh finite
+        u_th = max(0.0, min(u_th, 0.999))
+        u_th_t = torch.as_tensor(u_th, device=self.device, dtype=self.dtype)
+
+        Fy_f_max = torch.as_tensor(self._Fy_f_max, device=self.device, dtype=self.dtype)
+        Fy_r_max = torch.as_tensor(self._Fy_r_max, device=self.device, dtype=self.dtype)
+
+        # |tanh(C*alpha/Fmax)| = u_th  =>  |alpha| = (Fmax/C) * atanh(u_th)
+        alpha_th_f = (Fy_f_max / torch.as_tensor(p.Cf, device=self.device, dtype=self.dtype)) * torch.atanh(u_th_t)
+        alpha_th_r = (Fy_r_max / torch.as_tensor(p.Cr, device=self.device, dtype=self.dtype)) * torch.atanh(u_th_t)
+
+        alpha_excess_f = torch.relu(torch.abs(alpha_f) - alpha_th_f)
+        alpha_excess_r = torch.relu(torch.abs(alpha_r) - alpha_th_r)
+        return alpha_excess_f, alpha_excess_r, alpha_th_f, alpha_th_r
 
     # ---------- stateless / functional core ----------
     def tire_forces_with_saturation(
@@ -168,9 +205,11 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
 
         last_F_yf = None
         last_F_yr = None
+        last_alpha_f = None
+        last_alpha_r = None
 
         def substep(h: float):
-            nonlocal x, y, psi, v, a, delta, beta, r, last_F_yf, last_F_yr
+            nonlocal x, y, psi, v, a, delta, beta, r, last_F_yf, last_F_yr, last_alpha_f, last_alpha_r
             if h <= 0.0:
                 return
             h_t = torch.as_tensor(h, device=self.device, dtype=self.dtype)
@@ -183,8 +222,10 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
             v_eff = torch.clamp(v, min=self.v_eff_min)
 
             # tire forces
+            alpha_f, alpha_r = self.slip_angles(beta=beta, r=r, v_eff=v_eff, delta=delta)
             F_yf, F_yr = self.tire_forces_with_saturation(beta=beta, r=r, v_eff=v_eff, delta=delta)
             last_F_yf, last_F_yr = F_yf, F_yr
+            last_alpha_f, last_alpha_r = alpha_f, alpha_r
 
             # lateral dynamics
             beta_dot = (F_yf + F_yr) / (p.m * v_eff) - r
@@ -222,12 +263,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         if not return_info:
             return next_state, None
 
-        if last_F_yf is None:
-            # dt == 0 case
-            last_F_yf = torch.zeros_like(v)
-            last_F_yr = torch.zeros_like(v)
-
-        info = {"F_yf": last_F_yf, "F_yr": last_F_yr}
+        info = {"F_yf": last_F_yf, "F_yr": last_F_yr, "alpha_f": last_alpha_f, "alpha_r": last_alpha_r}
         return next_state, info
 
     # ---------- stateful API (env-style usage) ----------

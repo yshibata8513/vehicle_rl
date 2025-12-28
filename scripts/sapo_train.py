@@ -681,19 +681,21 @@ def main():
     parser.add_argument("--ds", type=float, default=1.0)
     parser.add_argument("--v-min-kph", type=float, default=50.0)
     parser.add_argument("--v-max-kph", type=float, default=80.0)
-    parser.add_argument("--R-min", type=float, default=100.0)
-    parser.add_argument("--R-max", type=float, default=400.0)
+    parser.add_argument("--R-min", type=float, default=30.0)
+    parser.add_argument("--R-max", type=float, default=60.0)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--kappa-preview", type=int, default=21)
 
     # reward weights (defaults match ppo_test STAGE3-ish)
     parser.add_argument("--w-y", type=float, default=0.1)
     parser.add_argument("--w-psi", type=float, default=10.0)
-    parser.add_argument("--w-v-under", type=float, default=0.5)
+    parser.add_argument("--w-v-under", type=float, default=0.05)
     parser.add_argument("--w-v-over", type=float, default=0.5)
-    parser.add_argument("--w-ay", type=float, default=0.001)
+    parser.add_argument("--w-ay", type=float, default=0.1)
+    parser.add_argument("--w-kappa", type=float, default=0.001)
     parser.add_argument("--w-d-delta-ref", type=float, default=1.0)
     parser.add_argument("--w-dd-delta-ref", type=float, default=0.1)
+    parser.add_argument("--w-tire-alpha-excess", type=float, default=0.1)
 
     # SAPO hyperparams
     parser.add_argument("--updates", type=int, default=2000)
@@ -751,12 +753,16 @@ def main():
         w_ay=float(args.w_ay),
         w_d_delta_ref=float(args.w_d_delta_ref),
         w_dd_delta_ref=float(args.w_dd_delta_ref),
+        w_kappa=float(args.w_kappa),
+        w_tire_alpha_excess=float(args.w_tire_alpha_excess),
         loss_y="l1",
         loss_psi="l1",
         loss_v="l1",
         loss_ay="l1",
         loss_d_delta_ref="l1",
         loss_dd_delta_ref="l1",
+        loss_kappa="l1",
+        loss_tire_alpha_excess="l1",
     )
 
     veh_params = VehicleParams()
