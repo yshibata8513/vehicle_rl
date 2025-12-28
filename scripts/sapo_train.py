@@ -675,14 +675,14 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
 
     # env / traj
-    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--traj-length", type=float, default=2000.0)
     parser.add_argument("--ds", type=float, default=1.0)
     parser.add_argument("--v-min-kph", type=float, default=50.0)
     parser.add_argument("--v-max-kph", type=float, default=80.0)
     parser.add_argument("--R-min", type=float, default=100.0)
-    parser.add_argument("--R-max", type=float, default=500.0)
+    parser.add_argument("--R-max", type=float, default=400.0)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--kappa-preview", type=int, default=21)
 
@@ -690,15 +690,15 @@ def main():
     parser.add_argument("--w-y", type=float, default=0.1)
     parser.add_argument("--w-psi", type=float, default=10.0)
     parser.add_argument("--w-v-under", type=float, default=0.5)
-    parser.add_argument("--w-v-over", type=float, default=1.5)
+    parser.add_argument("--w-v-over", type=float, default=0.5)
     parser.add_argument("--w-ay", type=float, default=0.001)
-    parser.add_argument("--w-d-delta-ref", type=float, default=10.0)
-    parser.add_argument("--w-dd-delta-ref", type=float, default=0.0)
+    parser.add_argument("--w-d-delta-ref", type=float, default=1.0)
+    parser.add_argument("--w-dd-delta-ref", type=float, default=0.1)
 
     # SAPO hyperparams
     parser.add_argument("--updates", type=int, default=2000)
-    parser.add_argument("--horizon", type=int, default=32)
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--horizon", type=int, default=128)
+    parser.add_argument("--gamma", type=float, default=0.999)
     parser.add_argument("--td-lambda", type=float, default=0.95)
     parser.add_argument("--critic-updates", type=int, default=16)
     parser.add_argument("--minibatch-size", type=int, default=1024)
@@ -751,12 +751,12 @@ def main():
         w_ay=float(args.w_ay),
         w_d_delta_ref=float(args.w_d_delta_ref),
         w_dd_delta_ref=float(args.w_dd_delta_ref),
-        loss_y="l2",
-        loss_psi="l2",
-        loss_v="l2",
-        loss_ay="l2",
-        loss_d_delta_ref="l2",
-        loss_dd_delta_ref="l2",
+        loss_y="l1",
+        loss_psi="l1",
+        loss_v="l1",
+        loss_ay="l1",
+        loss_d_delta_ref="l1",
+        loss_dd_delta_ref="l1",
     )
 
     veh_params = VehicleParams()
