@@ -90,6 +90,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         self,
         ref_trajs: List[ReferenceTrajectory],
         kappa_preview_offsets: Optional[Sequence[float]] = None,
+        v_preview_offsets: Optional[Sequence[float]] = None,
         vehicle_params: Optional[VehicleParams] = None,
         reward_weights: Optional[RewardWeights] = None,
         max_lateral_error: float = 5.0,
@@ -152,9 +153,12 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 psi = np.array([0.0], dtype=np.float64)
             self.psi_ref_mat[b] = torch.tensor(psi.tolist(), dtype=self.dtype, device=self.device)
 
-        #preview offsets (kappa)
         self.kappa_preview_offsets = torch.tensor(kappa_preview_offsets, dtype=self.dtype, device=self.device)
         self.P = int(self.kappa_preview_offsets.shape[0])
+
+        # preview offsets (v)
+        self.v_preview_offsets = torch.tensor(v_preview_offsets, dtype=self.dtype, device=self.device)
+        self.Q = int(self.v_preview_offsets.shape[0])
 
         # delta_ref history (B,5)
         self.delta_ref_history = torch.zeros(self.B, 5, dtype=self.dtype, device=self.device)
@@ -230,12 +234,15 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         y1 = y_mat[batch_idx, idx + 1]
         return (1.0 - t) * y0 + t * y1
 
-    def _interp_matrix_preview(self, s: torch.Tensor, y_mat: torch.Tensor) -> torch.Tensor:
+    def _interp_matrix_preview(self, s: torch.Tensor, y_mat: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         B = self.B
         N = self.Ns
-        P = self.P
+        #offsets len
+        P = int(offsets.shape[0])
+        if P == 0:
+            return torch.zeros(B, 0, dtype=self.dtype, device=self.device)
 
-        s_q = s.unsqueeze(1) + self.kappa_preview_offsets.unsqueeze(0)
+        s_q = s.unsqueeze(1) + offsets.unsqueeze(0)
         s_q = torch.clamp(s_q, self.s_ref[0], self.s_ref[-1] - 1e-6)
 
         s_q_flat = s_q.reshape(-1)
@@ -273,7 +280,9 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         delta_ref = env_state.vehicle_state[:, 8]
 
         v_ref_now = self._interp_matrix(env_state.s, self.v_ref_mat)
-        kappa_preview = self._interp_matrix_preview(env_state.s, self.kappa_ref_mat)
+        kappa_preview = self._interp_matrix_preview(env_state.s, self.kappa_ref_mat, self.kappa_preview_offsets)
+        v_preview = self._interp_matrix_preview(env_state.s, self.v_ref_mat, self.v_preview_offsets)
+
         # kappa0 is used for dynamics reward and frenet update
         if float(self.kappa_preview_offsets[0].item()) == 0.0:
             kappa0 = kappa_preview[:, 0]
@@ -292,6 +301,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             v_ref_now,
             env_state.delta_ref_history,  # (B,5)
             kappa_preview,                # (B,P)
+            v_preview,                    # (B,Q)
         ]
         obs = torch.cat([x if x.dim() == 2 else x.unsqueeze(1) for x in obs_list], dim=1)
         state_vec = torch.stack([e_y, e_psi_v, v, a, delta, delta_ref, beta, r], dim=1)
@@ -676,7 +686,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         r_max = max(0.5, r_margin * v_ref_max * kappa_max)
 
         P = int(self.P)
-        obs_dim_expected = 6 + 5 + P
+        Q = int(self.Q)
+        obs_dim_expected = 6 + 5 + P + Q
 
         obs_min = torch.empty(obs_dim_expected, device=device, dtype=dtype)
         obs_max = torch.empty(obs_dim_expected, device=device, dtype=dtype)
@@ -696,6 +707,10 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         obs_min[i:i+P] = -kappa_max
         obs_max[i:i+P] = kappa_max
         i += P
+
+        obs_min[i:i+Q] = v_ref_min
+        obs_max[i:i+Q] = v_ref_max
+        i += Q
 
         if i != obs_dim_expected:
             raise RuntimeError(f"obs_dim mismatch in normalizer build: got {i}, expected {obs_dim_expected}")

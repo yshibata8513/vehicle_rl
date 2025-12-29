@@ -753,6 +753,9 @@ def main():
     parser.add_argument("--R-max", type=float, default=100.0)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--kappa-preview", type=int, default=21)
+    parser.add_argument("--kappa-interval", type=float, default=3.0)
+    parser.add_argument("--v-preview", type=int, default=21)
+    parser.add_argument("--v-interval", type=float, default=3.0)
 
     # reward weights (defaults match ppo_test STAGE3-ish)
     parser.add_argument("--w-y", type=float, default=0.1)
@@ -871,11 +874,13 @@ def main():
         for _ in range(int(args.num_envs))
     ]
 
-    kappa_preview_offsets = [float(i) for i in range(int(args.kappa_preview))]
+    kappa_preview_offsets = [float(i) * float(args.kappa_interval) for i in range(int(args.kappa_preview))]
+    v_preview_offsets = [float(i) * float(args.v_interval) for i in range(int(args.v_preview))]
 
     env = BatchedPathTrackingEnvFrenetDifferentiable(
         ref_trajs=ref_trajs,
         kappa_preview_offsets=kappa_preview_offsets,
+        v_preview_offsets=v_preview_offsets,
         vehicle_params=veh_params,
         reward_weights=weights,
         max_steps=int(args.max_steps),
@@ -922,6 +927,7 @@ def main():
     eval_env = BatchedPathTrackingEnvFrenetDifferentiable(
         ref_trajs=eval_ref_trajs,
         kappa_preview_offsets=kappa_preview_offsets,
+        v_preview_offsets=v_preview_offsets,
         vehicle_params=veh_params,
         reward_weights=weights,
         max_steps=int(args.max_steps),
