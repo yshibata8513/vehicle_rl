@@ -24,7 +24,7 @@ def generate_random_reference_trajectory_arc_mix(
     seg_len_min: float = 80.0,      # 各セグメントの最短長さ [m]
     seg_len_max: float = 250.0,     # 各セグメントの最長長さ [m]
     transition_length: float = 30.0,# 曲率遷移区間の長さの上限 [m]
-    kappa_step_max: float = 0.002,  # 隣接セグメント間の曲率差の最大値 [1/m]
+    kappa_step_max: float = 0.50,  # 隣接セグメント間の曲率差の最大値 [1/m]
     straight_prob: float = 0.5,     # 直線セグメントを選ぶ確率
     seed: Optional[int] = None,
 ) -> ReferenceTrajectory:

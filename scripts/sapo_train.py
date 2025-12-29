@@ -34,19 +34,18 @@ import torch
 import sys
 sys.path.append("../src")
 
-from bicycle_model_differentiable_batched import VehicleParams
+from bicycle_model_differentiable_batched import VehicleParams, BatchedDifferentiableDynamicBicycleModel
 from environment_differentiable_batched import BatchedPathTrackingEnvFrenetDifferentiable, RewardWeights
 from sapo_agent_batched import SAPOAgentBatched, SAPOConfig
 
-try:
-    from trajectory_generator import (
-        generate_random_reference_trajectory_arc_mix,
-        calculate_max_curvature_rates,
-    )
-except Exception as e:  # pragma: no cover
-    generate_random_reference_trajectory_arc_mix = None
-    calculate_max_curvature_rates = None
-    _traj_import_error = e
+
+CKPT_PATH = "./checkpoints_sapo/sapo_20251228_141239_update00250.pt"
+
+
+from trajectory_generator import (
+    generate_random_reference_trajectory_arc_mix,
+    calculate_max_curvature_rates,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -310,6 +309,11 @@ def evaluate_policy_detailed(
     cur_ddelta_abs = torch.zeros(B, dtype=env.dtype, device=env.device)
     cur_dddelta_abs = torch.zeros(B, dtype=env.dtype, device=env.device)
 
+    cur_ekappa_abs = torch.zeros(B, dtype=env.dtype, device=env.device)
+    cur_cost_kappa = torch.zeros(B, dtype=env.dtype, device=env.device)
+    cur_tire_alpha_excess = torch.zeros(B, dtype=env.dtype, device=env.device)
+    cur_cost_tire_alpha_excess = torch.zeros(B, dtype=env.dtype, device=env.device)
+
     # episode results (stack later)
     ep_returns: List[torch.Tensor] = []
     ep_lengths: List[torch.Tensor] = []
@@ -324,6 +328,11 @@ def evaluate_policy_detailed(
     ep_cost_dddelta_mean: List[torch.Tensor] = []
     ep_ddelta_mean: List[torch.Tensor] = []
     ep_dddelta_mean: List[torch.Tensor] = []
+
+    ep_ekappa_mean: List[torch.Tensor] = []
+    ep_cost_kappa_mean: List[torch.Tensor] = []
+    ep_tire_alpha_excess_mean: List[torch.Tensor] = []
+    ep_cost_tire_alpha_excess_mean: List[torch.Tensor] = []
 
     # ---- XY & time-series logs (first episode only) ----
     num_xy_envs = min(int(num_xy_envs), B)
@@ -344,6 +353,9 @@ def evaluate_policy_detailed(
         ts_ddelta_ref_hist = [[] for _ in range(num_xy_envs)]
         ts_dd_delta_ref_hist = [[] for _ in range(num_xy_envs)]
         ts_s_hist = [[] for _ in range(num_xy_envs)]
+        ts_kappa_ref_hist = [[] for _ in range(num_xy_envs)]
+        ts_kappa_hat_hist = [[] for _ in range(num_xy_envs)]
+        ts_tire_alpha_excess_hist = [[] for _ in range(num_xy_envs)]
 
     for _t in range(int(max_steps)):
         # Do not accumulate further episodes once we already collected enough for that env.
@@ -388,6 +400,25 @@ def evaluate_policy_detailed(
         cur_ddelta_abs += active * torch.abs(d_delta_ref)
         cur_dddelta_abs += active * torch.abs(dd_delta_ref)
 
+        e_kappa = info.get("e_kappa", torch.zeros_like(v))
+        cur_ekappa_abs += active * torch.abs(e_kappa)
+        cur_cost_kappa += active * info.get("cost_kappa", torch.zeros_like(v))
+
+        alpha_f = info.get("alpha_f", None)
+        alpha_r = info.get("alpha_r", None)
+        # if alpha_f is None or alpha_r is None:
+        #     tire_alpha_excess_total = torch.zeros_like(v)
+        # else:
+        alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = env.vehicle.tire_alpha_excess_from_alphas(
+            alpha_f=alpha_f,
+            alpha_r=alpha_r,
+            util_threshold=float(getattr(env.weights, "tire_util_threshold", 0.8)),
+        )
+        tire_alpha_excess_total = alpha_excess_f + alpha_excess_r
+
+        cur_tire_alpha_excess += active * tire_alpha_excess_total
+        cur_cost_tire_alpha_excess += active * info.get("cost_tire_alpha_excess", torch.zeros_like(v))
+
         # XY/time-series (first episode only)
         if save_xy:
             for i in range(num_xy_envs):
@@ -409,6 +440,10 @@ def evaluate_policy_detailed(
                     ts_ddelta_ref_hist[i].append(float(d_delta_ref[i].detach().cpu().item()))
                     ts_dd_delta_ref_hist[i].append(float(dd_delta_ref[i].detach().cpu().item()))
                     ts_s_hist[i].append(float(env.s[i].detach().cpu().item()))
+
+                    ts_kappa_ref_hist[i].append(float(info.get("kappa0", torch.zeros_like(v))[i].detach().cpu().item()))
+                    ts_kappa_hat_hist[i].append(float(info.get("kappa_hat", torch.zeros_like(v))[i].detach().cpu().item()))
+                    ts_tire_alpha_excess_hist[i].append(float(tire_alpha_excess_total[i].detach().cpu().item()))
 
         # finalize episodes that ended this step (only for active envs)
         done_event = done_mask & (~finished)
@@ -433,6 +468,11 @@ def evaluate_policy_detailed(
             ep_ddelta_mean.append((cur_ddelta_abs[idx] / denom).detach().cpu())
             ep_dddelta_mean.append((cur_dddelta_abs[idx] / denom).detach().cpu())
 
+            ep_ekappa_mean.append((cur_ekappa_abs[idx] / denom).detach().cpu())
+            ep_cost_kappa_mean.append((cur_cost_kappa[idx] / denom).detach().cpu())
+            ep_tire_alpha_excess_mean.append((cur_tire_alpha_excess[idx] / denom).detach().cpu())
+            ep_cost_tire_alpha_excess_mean.append((cur_cost_tire_alpha_excess[idx] / denom).detach().cpu())
+
             # increment episode counter and clear accumulators for those envs
             ep_count[idx] += 1
 
@@ -449,6 +489,11 @@ def evaluate_policy_detailed(
             cur_cost_dddelta[idx] = 0.0
             cur_ddelta_abs[idx] = 0.0
             cur_dddelta_abs[idx] = 0.0
+
+            cur_ekappa_abs[idx] = 0.0
+            cur_cost_kappa[idx] = 0.0
+            cur_tire_alpha_excess[idx] = 0.0
+            cur_cost_tire_alpha_excess[idx] = 0.0
 
             # mark XY logging done for those envs (first episode only)
             if save_xy:
@@ -488,6 +533,10 @@ def evaluate_policy_detailed(
             "cost_d_delta_ref_mean": float("nan"),
             "dd_delta_ref_abs_mean": float("nan"),
             "cost_dd_delta_ref_mean": float("nan"),
+            "e_kappa_mean": float("nan"),
+            "cost_kappa_mean": float("nan"),
+            "tire_alpha_excess_mean": float("nan"),
+            "cost_tire_alpha_excess_mean": float("nan"),
         }
 
     ep_returns_t = torch.cat(ep_returns)
@@ -507,6 +556,11 @@ def evaluate_policy_detailed(
     ep_ddelta_mean_t = torch.cat(ep_ddelta_mean)
     ep_dddelta_mean_t = torch.cat(ep_dddelta_mean)
 
+    ep_ekappa_mean_t = torch.cat(ep_ekappa_mean)
+    ep_cost_kappa_mean_t = torch.cat(ep_cost_kappa_mean)
+    ep_tire_alpha_excess_mean_t = torch.cat(ep_tire_alpha_excess_mean)
+    ep_cost_tire_alpha_excess_mean_t = torch.cat(ep_cost_tire_alpha_excess_mean)
+
     result = {
         "return_mean": float(ep_returns_t.mean().item()),
         "return_std": float(ep_returns_t.std().item()),
@@ -524,6 +578,10 @@ def evaluate_policy_detailed(
         "cost_d_delta_ref_mean": float(ep_cost_ddelta_mean_t.mean().item()),
         "dd_delta_ref_abs_mean": float(ep_dddelta_mean_t.mean().item()),
         "cost_dd_delta_ref_mean": float(ep_cost_dddelta_mean_t.mean().item()),
+        "e_kappa_mean": float(ep_ekappa_mean_t.mean().item()),
+        "cost_kappa_mean": float(ep_cost_kappa_mean_t.mean().item()),
+        "tire_alpha_excess_mean": float(ep_tire_alpha_excess_mean_t.mean().item()),
+        "cost_tire_alpha_excess_mean": float(ep_cost_tire_alpha_excess_mean_t.mean().item()),
     }
 
     # ---- plot saving (XY + time-series) ----
@@ -567,7 +625,7 @@ def evaluate_policy_detailed(
                 continue
             t_axis = [k * dt_local for k in range(T)]
 
-            fig, axes = plt.subplots(8, 1, figsize=(10, 16), sharex=True)
+            fig, axes = plt.subplots(10, 1, figsize=(10, 20), sharex=True)
 
             axes[0].plot(t_axis, ts_v_hist[i], label="v [m/s]")
             axes[0].plot(t_axis, ts_vref_hist[i], label="v_ref [m/s]")
@@ -585,40 +643,50 @@ def evaluate_policy_detailed(
             axes[2].grid(True)
             axes[2].legend(loc="upper right")
 
-            delta_deg = [_math.degrees(d) for d in ts_delta_hist[i]]
-            delta_ref_deg = [_math.degrees(d) for d in ts_delta_ref_hist[i]]
-            axes[3].plot(t_axis, delta_deg, label="delta [deg]")
-            axes[3].plot(t_axis, delta_ref_deg, label="delta_ref [deg]")
-            if len(ts_delta_geom_hist[i]) == len(t_axis):
-                delta_geom_deg = [_math.degrees(d) for d in ts_delta_geom_hist[i]]
-                axes[3].plot(t_axis, delta_geom_deg, label="delta_geom [deg]")
-            axes[3].set_ylabel("Steering")
+            axes[3].plot(t_axis, ts_kappa_ref_hist[i], label="kappa_ref [1/m]")
+            axes[3].plot(t_axis, ts_kappa_hat_hist[i], label="kappa [1/m]")
+            axes[3].set_ylabel("Curvature")
             axes[3].grid(True)
             axes[3].legend(loc="upper right")
 
-            axes[4].plot(t_axis, ts_ey_hist[i], label="e_y [m]")
-            axes[4].set_ylabel("e_y")
+            delta_deg = [_math.degrees(d) for d in ts_delta_hist[i]]
+            delta_ref_deg = [_math.degrees(d) for d in ts_delta_ref_hist[i]]
+            axes[4].plot(t_axis, delta_deg, label="delta [deg]")
+            axes[4].plot(t_axis, delta_ref_deg, label="delta_ref [deg]")
+            if len(ts_delta_geom_hist[i]) == len(t_axis):
+                delta_geom_deg = [_math.degrees(d) for d in ts_delta_geom_hist[i]]
+                axes[4].plot(t_axis, delta_geom_deg, label="delta_geom [deg]")
+            axes[4].set_ylabel("Steering")
             axes[4].grid(True)
             axes[4].legend(loc="upper right")
 
-            axes[5].plot(t_axis, ts_epsi_hist[i], label="e_psi_v [rad]")
-            axes[5].set_ylabel("e_psi_v")
+            axes[5].plot(t_axis, ts_ey_hist[i], label="e_y [m]")
+            axes[5].set_ylabel("e_y")
             axes[5].grid(True)
             axes[5].legend(loc="upper right")
 
-            ddelta_deg_s = [_math.degrees(d) for d in ts_ddelta_ref_hist[i]]
-            axes[6].plot(t_axis, ddelta_deg_s, label="d_delta_ref [deg/s]")
-            axes[6].set_ylabel("d_delta_ref")
+            axes[6].plot(t_axis, ts_epsi_hist[i], label="e_psi_v [rad]")
+            axes[6].set_ylabel("e_psi_v")
             axes[6].grid(True)
             axes[6].legend(loc="upper right")
 
-            dddelta_deg_s2 = [_math.degrees(d) for d in ts_dd_delta_ref_hist[i]]
-            axes[7].plot(t_axis, dddelta_deg_s2, label="dd_delta_ref [deg/s^2]")
-            axes[7].set_xlabel("time [s]")
-            axes[7].set_ylabel("jerk")
+            axes[7].plot(t_axis, ts_tire_alpha_excess_hist[i], label="tire_alpha_excess [rad]")
+            axes[7].set_ylabel("alpha_excess")
             axes[7].grid(True)
             axes[7].legend(loc="upper right")
 
+            ddelta_deg_s = [_math.degrees(d) for d in ts_ddelta_ref_hist[i]]
+            axes[8].plot(t_axis, ddelta_deg_s, label="d_delta_ref [deg/s]")
+            axes[8].set_ylabel("d_delta_ref")
+            axes[8].grid(True)
+            axes[8].legend(loc="upper right")
+
+            dddelta_deg_s2 = [_math.degrees(d) for d in ts_dd_delta_ref_hist[i]]
+            axes[9].plot(t_axis, dddelta_deg_s2, label="dd_delta_ref [deg/s^2]")
+            axes[9].set_xlabel("time [s]")
+            axes[9].set_ylabel("jerk")
+            axes[9].grid(True)
+            axes[9].legend(loc="upper right")
             fig.suptitle(f"Eval time-series (env {i})")
             plt.tight_layout()
 
@@ -677,12 +745,12 @@ def main():
     # env / traj
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--dt", type=float, default=0.05)
-    parser.add_argument("--traj-length", type=float, default=2000.0)
+    parser.add_argument("--traj-length", type=float, default=3000.0)
     parser.add_argument("--ds", type=float, default=1.0)
     parser.add_argument("--v-min-kph", type=float, default=50.0)
     parser.add_argument("--v-max-kph", type=float, default=80.0)
-    parser.add_argument("--R-min", type=float, default=30.0)
-    parser.add_argument("--R-max", type=float, default=60.0)
+    parser.add_argument("--R-min", type=float, default=60.0)
+    parser.add_argument("--R-max", type=float, default=100.0)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--kappa-preview", type=int, default=21)
 
@@ -695,7 +763,7 @@ def main():
     parser.add_argument("--w-kappa", type=float, default=0.001)
     parser.add_argument("--w-d-delta-ref", type=float, default=1.0)
     parser.add_argument("--w-dd-delta-ref", type=float, default=0.1)
-    parser.add_argument("--w-tire-alpha-excess", type=float, default=0.1)
+    parser.add_argument("--w-tire-alpha-excess", type=float, default=1.0)
 
     # SAPO hyperparams
     parser.add_argument("--updates", type=int, default=2000)
@@ -729,7 +797,7 @@ def main():
     parser.add_argument("--reset-interval", type=int, default=0, help="if >0, reset env every N updates")
     parser.add_argument("--ckpt-interval", type=int, default=50)
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints_sapo")
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=bool, default=False)
     parser.add_argument("--run-id", type=str, default=None)
 
     args = parser.parse_args()
@@ -766,6 +834,27 @@ def main():
     )
 
     veh_params = VehicleParams()
+
+    # ---- Trajectory feasibility check (R_min -> max speed) ----
+    try:
+        R_min = float(args.R_min)
+        if R_min > 0.0:
+            kappa_min = 1.0 / R_min
+            _tmp_model = BatchedDifferentiableDynamicBicycleModel(params=veh_params, device=str(device), dtype=dtype)
+            v_lim = float(
+                _tmp_model.max_speed_for_kappa(torch.as_tensor(kappa_min, device=device, dtype=dtype))
+                .detach()
+                .cpu()
+                .item()
+            )
+            print(
+                f"[Traj] R_min={R_min:.3f} m -> kappa={kappa_min:.6f} 1/m -> "
+                f"max_speed_for_kappa={v_lim:.3f} m/s ({v_lim*3.6:.1f} km/h)"
+            )
+        else:
+            print(f"[Traj] R_min must be > 0, got {R_min}")
+    except Exception as _e:
+        print(f"[Traj] max_speed_for_kappa computation failed: {_e}")
 
     # ---- Build reference trajectories ----
     ref_trajs = [
@@ -882,7 +971,7 @@ def main():
 
         start_update = 0
         if args.resume:
-            ckpt = load_checkpoint(args.resume, agent, map_location=str(device))
+            ckpt = load_checkpoint(CKPT_PATH, agent, map_location=str(device))
             start_update = int(ckpt.get("update", 0)) + 1
             print(f"[Resume] Loaded checkpoint: {args.resume} (start_update={start_update})")
 
@@ -978,6 +1067,10 @@ def main():
             print(f"  mean cost_ay          : {stats['cost_ay_mean']:.6f}")
             print(f"  mean cost_d_delta_ref : {stats['cost_d_delta_ref_mean']:.6f}")
             print(f"  mean cost_dd_delta_ref: {stats['cost_dd_delta_ref_mean']:.6f}")
+            print(f"  mean |e_kappa|        : {stats['e_kappa_mean']:.6f}")
+            print(f"  mean cost_kappa       : {stats['cost_kappa_mean']:.6f}")
+            print(f"  mean tire_alpha_excess: {stats['tire_alpha_excess_mean']:.6f}")
+            print(f"  mean cost_tire_alpha_excess: {stats['cost_tire_alpha_excess_mean']:.6f}")
             print(f"==============================\n")
 
             if int(args.log_jsonl) == 1:

@@ -152,11 +152,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 psi = np.array([0.0], dtype=np.float64)
             self.psi_ref_mat[b] = torch.tensor(psi.tolist(), dtype=self.dtype, device=self.device)
 
-        # preview offsets (kappa)
-        if kappa_preview_offsets is None:
-            self.kappa_preview_offsets = torch.arange(21, device=self.device, dtype=self.dtype) * 1.0
-        else:
-            self.kappa_preview_offsets = torch.tensor(kappa_preview_offsets, dtype=self.dtype, device=self.device)
+        #preview offsets (kappa)
+        self.kappa_preview_offsets = torch.tensor(kappa_preview_offsets, dtype=self.dtype, device=self.device)
         self.P = int(self.kappa_preview_offsets.shape[0])
 
         # delta_ref history (B,5)
