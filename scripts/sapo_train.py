@@ -797,7 +797,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--kappa-preview", type=int, default=21)
     parser.add_argument("--kappa-interval", type=float, default=3.0)
-    parser.add_argument("--v-preview", type=int, default=21)
+    parser.add_argument("--v-preview", type=int, default=0)
     parser.add_argument("--v-interval", type=float, default=3.0)
 
     # reward weights (defaults match ppo_test STAGE3-ish)
