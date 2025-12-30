@@ -20,6 +20,7 @@ class ReferenceTrajectory:
     y_ref: np.ndarray
     kappa_ref: np.ndarray
     v_ref: np.ndarray
+    mu_ref: np.ndarray
     dt: float
 
 
@@ -41,6 +42,9 @@ def generate_random_reference_trajectory_arc_mix(
     P_allow: float = 0.6,           # 許容遠心加速度変化率（横方向ジャーク）[m/s^3]
     t_min: float = 3.0,             # 緩和走行時間の下限 [s]（0.0 で無効化）
     a_lat_max_g: float = 0.30,   # 許容横G（例: 0.15〜0.25 など）
+    # --- 追加（可変μ） ---
+    mu_min: float = 0.2,
+    mu_max: float = 0.8,
 ) -> ReferenceTrajectory:
     """
     直線＋円弧＋線形曲率遷移をランダムに組み合わせた ReferenceTrajectory を生成する。
@@ -56,12 +60,17 @@ def generate_random_reference_trajectory_arc_mix(
       （= 遷移の終端 κ と一定区間の κ が一致する。元実装の意図を明確化しつつ保持）。
     - 遷移長 L_tr はショーツ式（P_allow）および緩和走行時間下限（t_min）に基づいて動的決定する。
       線形曲率遷移で P = v^3 * (dκ/ds), かつ dκ/ds = Δκ/L より L >= v^3|Δκ|/P
+    - mu を mu_min ~ mu_max の範囲でランダムに1つの値を選び、全域で固定する（将来的な拡張のため配列としては用意する）。
     """
     rng = np.random.default_rng(seed)
 
     # s グリッド
     n_points = int(total_length / ds) + 1
     s_ref = np.arange(n_points) * ds
+
+    # 今回はTrajectory全体で一様な mu を採用
+    mu_val = rng.uniform(mu_min, mu_max)
+    mu_ref = np.full_like(s_ref, mu_val)
 
     # セグメントリスト: (seg_type, L_seg, kappa_start, kappa_end, v_ms)
     # seg_type: "const" or "linear"
@@ -107,9 +116,12 @@ def generate_random_reference_trajectory_arc_mix(
 
         # セグメントごとの速度をサンプル（遷移+一定曲率で同一速度）
         # 上限は曲率と許容横Gから決める: a_y = v^2*|kappa| <= a_lat_max
+        # ここで mu_val を考慮して物理限界も意識してもよいが、一旦 a_lat_max_g でキャップする
         G0 = 9.80665
         if abs(kappa_target) > 1e-9:
-            a_lat_max = a_lat_max_g * G0
+            # mu が低い場合はそちらで制限する (物理限界 mu*g)
+            eff_a_lat_g = min(a_lat_max_g, mu_val)
+            a_lat_max = eff_a_lat_g * G0
             v_cap_ms = np.sqrt(a_lat_max / abs(kappa_target))
             v_cap_kph = min(v_max_kph, v_cap_ms * 3.6)
         else:
@@ -222,6 +234,7 @@ def generate_random_reference_trajectory_arc_mix(
         y_ref=y_ref,
         kappa_ref=kappa_ref,
         v_ref=v_ref,
+        mu_ref=mu_ref,
         dt=dt,
     )
 

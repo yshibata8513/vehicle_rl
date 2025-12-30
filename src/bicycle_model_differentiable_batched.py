@@ -85,13 +85,11 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         self.F_yf: torch.Tensor = torch.zeros(1, device=self.device, dtype=self.dtype)
         self.F_yr: torch.Tensor = torch.zeros(1, device=self.device, dtype=self.dtype)
 
-        # precompute constant tire-force saturation bounds from static normal loads
+        # precompute constant normal loads from static mass distribution
         p = self.params
         L = p.lf + p.lr
-        Fzf = (p.m * p.g) * (p.lr / L)
-        Fzr = (p.m * p.g) * (p.lf / L)
-        self._Fy_f_max = float(p.mu * Fzf)
-        self._Fy_r_max = float(p.mu * Fzr)
+        self.Fzf = (p.m * p.g) * (p.lr / L)
+        self.Fzr = (p.m * p.g) * (p.lf / L)
 
     @property
     def batch_size(self) -> int:
@@ -107,6 +105,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         self,
         alpha_f: torch.Tensor,
         alpha_r: torch.Tensor,
+        mu: torch.Tensor,
         *,
         util_threshold: float = 0.8,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -123,8 +122,11 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         u_th = max(0.0, min(u_th, 0.999))
         u_th_t = torch.as_tensor(u_th, device=self.device, dtype=self.dtype)
 
-        Fy_f_max = torch.as_tensor(self._Fy_f_max, device=self.device, dtype=self.dtype)
-        Fy_r_max = torch.as_tensor(self._Fy_r_max, device=self.device, dtype=self.dtype)
+        # Dynamic Fy_max based on mu
+        Fzf = torch.as_tensor(self.Fzf, device=self.device, dtype=self.dtype)
+        Fzr = torch.as_tensor(self.Fzr, device=self.device, dtype=self.dtype)
+        Fy_f_max = mu * Fzf
+        Fy_r_max = mu * Fzr
 
         # |tanh(C*alpha/Fmax)| = u_th  =>  |alpha| = (Fmax/C) * atanh(u_th)
         alpha_th_f = (Fy_f_max / torch.as_tensor(p.Cf, device=self.device, dtype=self.dtype)) * torch.atanh(u_th_t)
@@ -141,13 +143,17 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         r: torch.Tensor,
         v_eff: torch.Tensor,
         delta: torch.Tensor,
+        mu: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         p = self.params
         alpha_f = beta + p.lf * r / v_eff - delta
         alpha_r = beta - p.lr * r / v_eff
 
-        Fy_f_max = torch.as_tensor(self._Fy_f_max, device=self.device, dtype=self.dtype)
-        Fy_r_max = torch.as_tensor(self._Fy_r_max, device=self.device, dtype=self.dtype)
+        Fzf = torch.as_tensor(self.Fzf, device=self.device, dtype=self.dtype)
+        Fzr = torch.as_tensor(self.Fzr, device=self.device, dtype=self.dtype)
+
+        Fy_f_max = mu * Fzf
+        Fy_r_max = mu * Fzr
 
         # F = F_max * tanh( -Cf * alpha / F_max )
         F_yf = Fy_f_max * torch.tanh(-p.Cf * alpha_f / Fy_f_max)
@@ -160,6 +166,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         state: torch.Tensor,
         action: torch.Tensor,
         dt: float,
+        mu: torch.Tensor,
         return_info: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """
@@ -223,7 +230,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
 
             # tire forces
             alpha_f, alpha_r = self.slip_angles(beta=beta, r=r, v_eff=v_eff, delta=delta)
-            F_yf, F_yr = self.tire_forces_with_saturation(beta=beta, r=r, v_eff=v_eff, delta=delta)
+            F_yf, F_yr = self.tire_forces_with_saturation(beta=beta, r=r, v_eff=v_eff, delta=delta, mu=mu)
             last_F_yf, last_F_yr = F_yf, F_yr
             last_alpha_f, last_alpha_r = alpha_f, alpha_r
 
@@ -294,11 +301,11 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         self.F_yr = torch.zeros(B, device=self.device, dtype=self.dtype)
         return self.state.clone()
 
-    def step(self, action: torch.Tensor, dt: float, compute_info: bool = True) -> torch.Tensor:
+    def step(self, action: torch.Tensor, dt: float, mu: torch.Tensor, compute_info: bool = True) -> torch.Tensor:
         """
         Differentiable step that updates internal self.state.
         """
-        next_state, info = self.functional_step(self.state, action, dt, return_info=compute_info)
+        next_state, info = self.functional_step(self.state, action, dt, mu=mu, return_info=compute_info)
         self.state = next_state
         if compute_info and info is not None:
             self.F_yf = info["F_yf"]
@@ -319,6 +326,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
     def max_speed_for_kappa(
         self,
         kappa: torch.Tensor,
+        mu: torch.Tensor,
         v_max_in: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> torch.Tensor:
@@ -327,7 +335,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         """
         p = self.params
         kappa_t = torch.as_tensor(kappa, device=self.device, dtype=self.dtype)
-        mu_g = torch.as_tensor(p.mu * p.g, device=self.device, dtype=self.dtype)
+        mu_g = mu * torch.as_tensor(p.g, device=self.device, dtype=self.dtype)
         denom = torch.abs(kappa_t) + float(eps)
         v_limit = torch.sqrt(mu_g / denom)
         if v_max_in is None:

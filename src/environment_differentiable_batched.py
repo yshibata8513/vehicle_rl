@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
         y_ref: Sequence[float]
         v_ref: Sequence[float]
         kappa_ref: Sequence[float]
+        mu_ref: Sequence[float]
         dt: float
 
 
@@ -90,8 +91,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
     - Also provides a stateful `step()` for compatibility (implemented by calling functional_step
       and replacing internal state tensors).
 
-    Observation (B, 6 + 5 + P):
-      [e_y, e_psi_v, v, a, r, v_ref_now, delta_ref_history(5), kappa_preview(P)]
+    Observation (B, 6 + 5 + P + 1):
+      [e_y, e_psi_v, v, a, r, v_ref_now, mu_now, delta_ref_history(5), kappa_preview(P), v_preview(Q)]
     State vector (B, 8):
       [e_y, e_psi_v, v, a, delta, delta_ref, beta, r]
     """
@@ -140,6 +141,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         # ---------- reference mats (B, N) ----------
         self.v_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
         self.kappa_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
+        self.mu_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
         self.psi_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
 
         for b, traj in enumerate(ref_trajs):
@@ -147,12 +149,14 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             y_ref = np.asarray(traj.y_ref, dtype=np.float64)
             v_ref = np.asarray(traj.v_ref, dtype=np.float64)
             kappa_ref = np.asarray(traj.kappa_ref, dtype=np.float64)
+            mu_ref = np.asarray(traj.mu_ref, dtype=np.float64)
 
-            if not (len(x_ref) == N and len(y_ref) == N and len(v_ref) == N and len(kappa_ref) == N):
+            if not (len(x_ref) == N and len(y_ref) == N and len(v_ref) == N and len(kappa_ref) == N and len(mu_ref) == N):
                 raise ValueError("All reference arrays must have same length as s_ref")
 
             self.v_ref_mat[b] = torch.tensor(v_ref.tolist(), dtype=self.dtype, device=self.device)
             self.kappa_ref_mat[b] = torch.tensor(kappa_ref.tolist(), dtype=self.dtype, device=self.device)
+            self.mu_ref_mat[b] = torch.tensor(mu_ref.tolist(), dtype=self.dtype, device=self.device)
 
             dx = np.diff(x_ref)
             dy = np.diff(y_ref)
@@ -290,6 +294,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         delta_ref = env_state.vehicle_state[:, 8]
 
         v_ref_now = self._interp_matrix(env_state.s, self.v_ref_mat)
+        mu_now = self._interp_matrix(env_state.s, self.mu_ref_mat)
         kappa_preview = self._interp_matrix_preview(env_state.s, self.kappa_ref_mat, self.kappa_preview_offsets)
         v_preview = self._interp_matrix_preview(env_state.s, self.v_ref_mat, self.v_preview_offsets)
 
@@ -309,6 +314,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             a,
             r,
             v_ref_now,
+            mu_now,
             env_state.delta_ref_history,  # (B,5)
             kappa_preview,                # (B,P)
             v_preview,                    # (B,Q)
@@ -323,7 +329,9 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             "beta": beta,
             "r": r,
             "delta_ref": delta_ref,
+            "delta_ref": delta_ref,
             "v_ref_now": v_ref_now,
+            "mu_now": mu_now,
             "kappa0": kappa0,
             "kappa_preview": kappa_preview,
             "e_y": e_y,
@@ -358,6 +366,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         delta_ref = cache["delta_ref"]
         beta = cache["beta"]
         kappa0 = cache["kappa0"]
+        mu_now = cache["mu_now"]
 
         # geometric steer from curvature (used for logging)
         delta_geom = self.vehicle.steering_from_kappa(kappa0)
@@ -394,6 +403,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = self.vehicle.tire_alpha_excess_from_alphas(
             alpha_f=alpha_f,
             alpha_r=alpha_r,
+            mu=mu_now,
             util_threshold=float(getattr(w, 'tire_util_threshold', 0.8)),
         )
         cost_tire_alpha_excess = w.w_tire_alpha_excess * (
@@ -426,6 +436,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 "e_kappa": e_kappa,
                 "a_y": a_y,
                 "v_ref": v_ref_now,
+                "mu_now": mu_now,
                 "s": env_state.s,
                 "kappa0": kappa0,
                 "delta_geom": delta_geom,
@@ -521,7 +532,9 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             return s, e_y, e_psi_v
 
         for _ in range(n_full):
-            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_int, return_info=True)
+            # Pass mu0 to vehicle model
+            mu0 = self._interp_matrix(s, self.mu_ref_mat)
+            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_int, mu=mu0, return_info=True)
             F_yf = vinfo.get("F_yf", None)
             F_yr = vinfo.get("F_yr", None)
             alpha_f = vinfo.get("alpha_f", None)
@@ -529,7 +542,14 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_int)
 
         if dt_rem > 0.0:
-            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_rem, return_info=True)
+            # Need strict mu interpolation? For small step, reusing mu0 is fine approx or re-interp but frenet_substep updates s
+            # Let's re-interp inside frenet_substep but we need mu for vehicle step which happens BEFORE frenet step updates s fully?
+            # Actually loop structure: vehicle step updates state, then frenet step updates s using new state.
+            # Ideally mu should be based on s at start of step. s is updated after vehicle step in this loop.
+            # So using mu from start of substep is correct.
+            # Recalculate mu0 for the last partial step if s changed in the loop
+            mu0 = self._interp_matrix(s, self.mu_ref_mat)
+            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_rem, mu=mu0, return_info=True)
             F_yf = vinfo.get("F_yf", None)
             F_yr = vinfo.get("F_yr", None)
             alpha_f = vinfo.get("alpha_f", None)
@@ -699,7 +719,10 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
 
         P = int(self.P)
         Q = int(self.Q)
-        obs_dim_expected = 6 + 5 + P + Q
+        P = int(self.P)
+        Q = int(self.Q)
+        # obs_dim = 6 + 1(mu) + 5(delta_history) + P(kappa) + Q(v_prev)
+        obs_dim_expected = 6 + 1 + 5 + P + Q
 
         obs_min = torch.empty(obs_dim_expected, device=device, dtype=dtype)
         obs_max = torch.empty(obs_dim_expected, device=device, dtype=dtype)
@@ -711,6 +734,9 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         obs_min[i], obs_max[i] = config.a_min, config.a_max; i += 1
         obs_min[i], obs_max[i] = -r_max, r_max; i += 1
         obs_min[i], obs_max[i] = config.v_ref_min, config.v_ref_max; i += 1
+        
+        # mu: fixed [0.0, 1.0]
+        obs_min[i], obs_max[i] = 0.0, 1.0; i += 1
 
         obs_min[i:i+5] = -config.delta_max
         obs_max[i:i+5] = config.delta_max
@@ -796,8 +822,14 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 dtype=self.dtype,
                 device=self.device,
             )
+            mu_ref = torch.tensor(
+                np.asarray(traj.mu_ref, dtype=np.float64).tolist(),
+                dtype=self.dtype,
+                device=self.device,
+            )
             self.v_ref_mat[b] = v_ref
             self.kappa_ref_mat[b] = kappa_ref
+            self.mu_ref_mat[b] = mu_ref
 
             x_ref = np.asarray(traj.x_ref, dtype=np.float64)
             y_ref = np.asarray(traj.y_ref, dtype=np.float64)

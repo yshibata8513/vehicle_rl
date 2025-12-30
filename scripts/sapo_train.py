@@ -68,6 +68,8 @@ def make_train_traj(
     R_min: float,
     R_max: float,
     seed: Optional[int] = None,
+    mu_min: float = 0.2,
+    mu_max: float = 0.8,
 ):
     if generate_random_reference_trajectory_arc_mix is None:
         raise RuntimeError(
@@ -84,6 +86,8 @@ def make_train_traj(
         R_min=R_min,
         R_max=R_max,
         seed=seed,
+        mu_min=mu_min,
+        mu_max=mu_max,
     )
 
 
@@ -452,9 +456,11 @@ def evaluate_policy_detailed(
         # if alpha_f is None or alpha_r is None:
         #     tire_alpha_excess_total = torch.zeros_like(v)
         # else:
+        mu_now = info.get("mu_now", None)
         alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = env.vehicle.tire_alpha_excess_from_alphas(
             alpha_f=alpha_f,
             alpha_r=alpha_r,
+            mu=mu_now,
             util_threshold=float(getattr(env.weights, "tire_util_threshold", 0.8)),
         )
         tire_alpha_excess_total = alpha_excess_f + alpha_excess_r
@@ -792,12 +798,14 @@ def main():
     parser.add_argument("--ds", type=float, default=1.0)
     parser.add_argument("--v-min-kph", type=float, default=50.0)
     parser.add_argument("--v-max-kph", type=float, default=100.0)
+    parser.add_argument("--mu-min", type=float, default=0.2)
+    parser.add_argument("--mu-max", type=float, default=0.9)
     parser.add_argument("--R-min", type=float, default=60.0)
     parser.add_argument("--R-max", type=float, default=100.0)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--kappa-preview", type=int, default=21)
     parser.add_argument("--kappa-interval", type=float, default=3.0)
-    parser.add_argument("--v-preview", type=int, default=21)
+    parser.add_argument("--v-preview", type=int, default=0)
     parser.add_argument("--v-interval", type=float, default=3.0)
 
     # reward weights (defaults match ppo_test STAGE3-ish)
@@ -887,8 +895,10 @@ def main():
         if R_min > 0.0:
             kappa_min = 1.0 / R_min
             _tmp_model = BatchedDifferentiableDynamicBicycleModel(params=veh_params, device=str(device), dtype=dtype)
+            # Use mu_min for conservative feasibility check
+            mu_check = torch.tensor(float(args.mu_min), device=device, dtype=dtype)
             v_lim = float(
-                _tmp_model.max_speed_for_kappa(torch.as_tensor(kappa_min, device=device, dtype=dtype))
+                _tmp_model.max_speed_for_kappa(torch.as_tensor(kappa_min, device=device, dtype=dtype), mu=mu_check)
                 .detach()
                 .cpu()
                 .item()
@@ -913,6 +923,8 @@ def main():
             R_min=float(args.R_min),
             R_max=float(args.R_max),
             seed=None,
+            mu_min=float(args.mu_min),
+            mu_max=float(args.mu_max),
         )
         for _ in range(int(args.num_envs))
     ]
@@ -938,6 +950,8 @@ def main():
             R_min=float(args.R_min),
             R_max=float(args.R_max),
             seed=None,
+            mu_min=float(args.mu_min),
+            mu_max=float(args.mu_max),
         ),
         angle_wrap_mode="atan2",
     )
@@ -987,6 +1001,8 @@ def main():
             R_min=float(args.R_min),
             R_max=float(args.R_max),
             seed=1000 + i,
+            mu_min=float(args.mu_min),
+            mu_max=float(args.mu_max),
         )
         for i in range(max(1, int(args.eval_envs)))
     ]
@@ -1044,9 +1060,9 @@ def main():
 
         start_update = 0
         if args.resume:
-            ckpt = load_checkpoint(args.resume, agent, map_location=str(device), expected_obs_config=obs_config, expected_action_min=action_min, expected_action_max=action_max)
+            ckpt = load_checkpoint(CKPT_PATH, agent, map_location=str(device), expected_obs_config=obs_config, expected_action_min=action_min, expected_action_max=action_max)
             start_update = int(ckpt.get("update", 0)) + 1
-            print(f"[Resume] Loaded checkpoint: {args.resume} (start_update={start_update})")
+            print(f"[Resume] Loaded checkpoint: {CKPT_PATH} (start_update={start_update})")
 
         # Save a run config for reproducibility
         cfg_path = os.path.join(args.ckpt_dir, f"{run_id}_config.json")
