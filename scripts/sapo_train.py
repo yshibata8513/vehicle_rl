@@ -35,7 +35,11 @@ import sys
 sys.path.append("../src")
 
 from bicycle_model_differentiable_batched import VehicleParams, BatchedDifferentiableDynamicBicycleModel
-from environment_differentiable_batched import BatchedPathTrackingEnvFrenetDifferentiable, RewardWeights
+from environment_differentiable_batched import (
+    BatchedPathTrackingEnvFrenetDifferentiable,
+    RewardWeights,
+    ObsNormalizationConfig,
+)
 from sapo_agent_batched import SAPOAgentBatched, SAPOConfig
 
 
@@ -133,6 +137,9 @@ def save_checkpoint(
     agent: SAPOAgentBatched,
     update: int,
     args: argparse.Namespace,
+    obs_config: Optional[ObsNormalizationConfig] = None,
+    action_min: Optional[np.ndarray] = None,
+    action_max: Optional[np.ndarray] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload: Dict[str, Any] = {
@@ -147,6 +154,12 @@ def save_checkpoint(
         "opt_critic": agent.critic_opt.state_dict(),
         "opt_alpha": agent.alpha_opt.state_dict(),
     }
+    if obs_config is not None:
+        payload["obs_config"] = asdict(obs_config)
+    if action_min is not None:
+        payload["action_min"] = np.asarray(action_min, dtype=np.float32).tolist()
+    if action_max is not None:
+        payload["action_max"] = np.asarray(action_max, dtype=np.float32).tolist()
     if extra:
         payload["extra"] = extra
     torch.save(payload, ckpt_path)
@@ -156,6 +169,10 @@ def load_checkpoint(
     ckpt_path: str,
     agent: SAPOAgentBatched,
     map_location: str = "cpu",
+    *,
+    expected_obs_config: Optional[ObsNormalizationConfig] = None,
+    expected_action_min: Optional[np.ndarray] = None,
+    expected_action_max: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     ckpt = torch.load(ckpt_path, map_location=map_location)
     agent.actor.load_state_dict(ckpt["actor"])
@@ -166,6 +183,32 @@ def load_checkpoint(
     agent.actor_opt.load_state_dict(ckpt["opt_actor"])
     agent.critic_opt.load_state_dict(ckpt["opt_critic"])
     agent.alpha_opt.load_state_dict(ckpt["opt_alpha"])
+
+    # ---- Fail fast if normalization / action bounds differ ----
+    if expected_obs_config is not None:
+        if "obs_config" not in ckpt:
+            raise KeyError("Checkpoint missing 'obs_config'. Please re-save checkpoints with obs_config included.")
+        ckpt_obs = ckpt["obs_config"]
+        exp_obs = asdict(expected_obs_config)
+        for k, v in exp_obs.items():
+            if k not in ckpt_obs:
+                raise KeyError(f"Checkpoint obs_config missing key: {k}")
+            if abs(float(ckpt_obs[k]) - float(v)) > 1e-6:
+                raise AssertionError(f"obs_config mismatch for '{k}': ckpt={ckpt_obs[k]} vs current={v}")
+
+    if (expected_action_min is not None) or (expected_action_max is not None):
+        if ("action_min" not in ckpt) or ("action_max" not in ckpt):
+            raise KeyError("Checkpoint missing 'action_min'/'action_max'. Please re-save checkpoints with action bounds included.")
+        ckpt_min = np.asarray(ckpt["action_min"], dtype=np.float32)
+        ckpt_max = np.asarray(ckpt["action_max"], dtype=np.float32)
+        if expected_action_min is not None:
+            exp_min = np.asarray(expected_action_min, dtype=np.float32)
+            if ckpt_min.shape != exp_min.shape or not np.allclose(ckpt_min, exp_min, atol=1e-6, rtol=0.0):
+                raise AssertionError(f"action_min mismatch: ckpt={ckpt_min.tolist()} vs current={exp_min.tolist()}")
+        if expected_action_max is not None:
+            exp_max = np.asarray(expected_action_max, dtype=np.float32)
+            if ckpt_max.shape != exp_max.shape or not np.allclose(ckpt_max, exp_max, atol=1e-6, rtol=0.0):
+                raise AssertionError(f"action_max mismatch: ckpt={ckpt_max.tolist()} vs current={exp_max.tolist()}")
     return ckpt
 
 
@@ -748,7 +791,7 @@ def main():
     parser.add_argument("--traj-length", type=float, default=3000.0)
     parser.add_argument("--ds", type=float, default=1.0)
     parser.add_argument("--v-min-kph", type=float, default=50.0)
-    parser.add_argument("--v-max-kph", type=float, default=80.0)
+    parser.add_argument("--v-max-kph", type=float, default=100.0)
     parser.add_argument("--R-min", type=float, default=60.0)
     parser.add_argument("--R-max", type=float, default=100.0)
     parser.add_argument("--max-steps", type=int, default=2000)
@@ -766,7 +809,7 @@ def main():
     parser.add_argument("--w-kappa", type=float, default=0.001)
     parser.add_argument("--w-d-delta-ref", type=float, default=1.0)
     parser.add_argument("--w-dd-delta-ref", type=float, default=0.1)
-    parser.add_argument("--w-tire-alpha-excess", type=float, default=1.0)
+    parser.add_argument("--w-tire-alpha-excess", type=float, default=1.)
 
     # SAPO hyperparams
     parser.add_argument("--updates", type=int, default=2000)
@@ -899,6 +942,29 @@ def main():
         angle_wrap_mode="atan2",
     )
 
+
+    # ---- Init obs normalizer (manual) ----
+    # NOTE: 正規化レンジは初期バッチの実測ではなく、軌道生成パラメータから理論上の最大/最小で固定する
+    v_ref_min = float(args.v_min_kph) / 3.6
+    v_ref_max = float(args.v_max_kph) / 3.6
+    if float(args.R_min) <= 0.0:
+        raise ValueError(f"Invalid R_min: {args.R_min}")
+    kappa_max = 1.0 / float(args.R_min)
+
+    a_min = float(getattr(veh_params, "min_accel", -6.0))
+    a_max = float(getattr(veh_params, "max_accel", 3.0))
+    delta_max = float(getattr(veh_params, "max_steer", math.radians(30)))
+
+    obs_config = ObsNormalizationConfig(
+        v_ref_min=v_ref_min,
+        v_ref_max=v_ref_max,
+        kappa_max=kappa_max,
+        a_min=a_min,
+        a_max=a_max,
+        delta_max=delta_max,
+    )
+    env.init_obs_normalizer(obs_config)
+
     init_state = make_init_state(ref_trajs, device=device, dtype=dtype)
     obs_norm, _obs_raw, _state_vec = env.reset(init_state, is_perturbed=False)
     obs_dim = int(obs_norm.shape[1])
@@ -935,6 +1001,7 @@ def main():
         dtype=dtype,
         angle_wrap_mode="atan2",
     )
+    eval_env.init_obs_normalizer(obs_config)
     eval_init_state = make_init_state(eval_ref_trajs, device=device, dtype=dtype)
     eval_env.reset(eval_init_state, is_perturbed=False)
 
@@ -977,7 +1044,7 @@ def main():
 
         start_update = 0
         if args.resume:
-            ckpt = load_checkpoint(CKPT_PATH, agent, map_location=str(device))
+            ckpt = load_checkpoint(args.resume, agent, map_location=str(device), expected_obs_config=obs_config, expected_action_min=action_min, expected_action_max=action_max)
             start_update = int(ckpt.get("update", 0)) + 1
             print(f"[Resume] Loaded checkpoint: {args.resume} (start_update={start_update})")
 
@@ -1088,12 +1155,12 @@ def main():
 
         if args.ckpt_interval and (update % int(args.ckpt_interval) == 0) and update != start_update:
             ckpt_path = os.path.join(args.ckpt_dir, f"{run_id}_update{update:05d}.pt")
-            save_checkpoint(ckpt_path=ckpt_path, agent=agent, update=update, args=args, extra={"run_id": run_id})
+            save_checkpoint(ckpt_path=ckpt_path, agent=agent, update=update, args=args, obs_config=obs_config, action_min=action_min, action_max=action_max, extra={"run_id": run_id})
             print(f"[Checkpoint] Saved: {ckpt_path}")
 
     # final checkpoint
     ckpt_path = os.path.join(args.ckpt_dir, f"{run_id}_final.pt")
-    save_checkpoint(ckpt_path=ckpt_path, agent=agent, update=int(args.updates) - 1, args=args, extra={"run_id": run_id})
+    save_checkpoint(ckpt_path=ckpt_path, agent=agent, update=int(args.updates) - 1, args=args, obs_config=obs_config, action_min=action_min, action_max=action_max, extra={"run_id": run_id})
     print(f"[Checkpoint] Saved final: {ckpt_path}")
 
 if __name__ == "__main__":

@@ -58,6 +58,16 @@ class RewardWeights:
 # =========================
 
 @dataclass
+class ObsNormalizationConfig:
+    v_ref_min: float
+    v_ref_max: float
+    kappa_max: float
+    a_min: float
+    a_max: float
+    delta_max: float
+
+
+@dataclass
 class BatchedFrenetEnvState:
     """
     All tensors are batched with leading dimension B (batch size = number of reference trajectories).
@@ -375,9 +385,11 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         # curvature tracking (path curvature from lateral accel)
         v_eff = torch.clamp(v, min=float(getattr(self.vehicle, 'v_eff_min', 1e-3)))
         v_kappa = torch.clamp(v, min=1e-3)
-        kappa_hat = a_y / (v_eff * v_kappa)
-        e_kappa = kappa_hat - kappa0
-        cost_kappa = w.w_kappa * self._penalty(e_kappa, w.loss_kappa)
+        kappa_hat = a_y.detach() / (v_eff * v_kappa)
+        _sign = torch.sign(kappa0)
+        same_dir = (_sign * kappa_hat > 0).to(kappa_hat.dtype)
+        e_kappa = _sign * (kappa0 - kappa_hat)
+        cost_kappa = w.w_kappa * self._penalty(torch.relu(e_kappa), w.loss_kappa) * same_dir        
 
         alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = self.vehicle.tire_alpha_excess_from_alphas(
             alpha_f=alpha_f,
@@ -665,25 +677,25 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
     # observation normalization
     # -----------------
 
-    def _init_obs_normalizer(self) -> None:
-        p = self.vehicle.params
+    def init_obs_normalizer(
+        self,
+        config: ObsNormalizationConfig,
+    ) -> None:
+        """
+        Manually initialize observation normalizer with given scalar limits (via config).
+        Constructs obs_min/obs_max using self.P and self.Q.
+        Must be called before using the environment for training/eval with normalize_obs=True.
+        """
         device, dtype = self.device, self.dtype
-
-        v_ref_min = float(self.v_ref_mat.min().item())
-        v_ref_max = float(self.v_ref_mat.max().item())
-        kappa_max = float(self.kappa_ref_mat.abs().max().item())
 
         ey_max = float(self.max_lateral_error)
         epsi_max = float(np.pi)
-        a_min = float(getattr(p, "min_accel", -6.0))
-        a_max = float(getattr(p, "max_accel", 3.0))
-        delta_max = float(getattr(p, "max_steer", np.deg2rad(30)))
-
+        
         v_min = 0.0
-        v_max = max(1.0, 1.5 * v_ref_max)
+        v_max = max(1.0, 1.5 * config.v_ref_max)
 
         r_margin = 3.0
-        r_max = max(0.5, r_margin * v_ref_max * kappa_max)
+        r_max = max(0.5, r_margin * config.v_ref_max * config.kappa_max)
 
         P = int(self.P)
         Q = int(self.Q)
@@ -696,35 +708,33 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         obs_min[i], obs_max[i] = -ey_max, ey_max; i += 1
         obs_min[i], obs_max[i] = -epsi_max, epsi_max; i += 1
         obs_min[i], obs_max[i] = v_min, v_max; i += 1
-        obs_min[i], obs_max[i] = a_min, a_max; i += 1
+        obs_min[i], obs_max[i] = config.a_min, config.a_max; i += 1
         obs_min[i], obs_max[i] = -r_max, r_max; i += 1
-        obs_min[i], obs_max[i] = v_ref_min, v_ref_max; i += 1
+        obs_min[i], obs_max[i] = config.v_ref_min, config.v_ref_max; i += 1
 
-        obs_min[i:i+5] = -delta_max
-        obs_max[i:i+5] = delta_max
+        obs_min[i:i+5] = -config.delta_max
+        obs_max[i:i+5] = config.delta_max
         i += 5
 
-        obs_min[i:i+P] = -kappa_max
-        obs_max[i:i+P] = kappa_max
+        obs_min[i:i+P] = -config.kappa_max
+        obs_max[i:i+P] = config.kappa_max
         i += P
 
-        obs_min[i:i+Q] = v_ref_min
-        obs_max[i:i+Q] = v_ref_max
+        obs_min[i:i+Q] = config.v_ref_min
+        obs_max[i:i+Q] = config.v_ref_max
         i += Q
 
         if i != obs_dim_expected:
             raise RuntimeError(f"obs_dim mismatch in normalizer build: got {i}, expected {obs_dim_expected}")
 
-        mid = 0.5 * (obs_max + obs_min)
-        scale = 0.5 * (obs_max - obs_min)
-        scale = torch.clamp(scale, min=1e-6)
+        self._obs_norm_mid = 0.5 * (obs_max + obs_min)
+        self._obs_norm_scale = (0.5 * (obs_max - obs_min))
+        self._obs_norm_scale = torch.clamp(self._obs_norm_scale, min=1e-6)
 
-        self._obs_norm_mid = mid
-        self._obs_norm_scale = scale
 
     def normalize_obs(self, obs: torch.Tensor, clip: Optional[float] = 5.0) -> torch.Tensor:
         if not hasattr(self, "_obs_norm_mid") or not hasattr(self, "_obs_norm_scale"):
-            self._init_obs_normalizer()
+            raise RuntimeError("Observation normalizer not initialized. Call env.init_obs_normalizer(config) first.")
 
         if obs.size(-1) != self._obs_norm_mid.numel():
             raise ValueError(f"obs_dim mismatch: got {obs.size(-1)}, expected {self._obs_norm_mid.numel()}")
@@ -813,11 +823,6 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             init_state[b, 3] = v0
             init_state[b, 4:] = 0.0
 
-        # trajectory swap => rebuild normalizer cache next time
-        if hasattr(self, "_obs_norm_mid"):
-            delattr(self, "_obs_norm_mid")
-        if hasattr(self, "_obs_norm_scale"):
-            delattr(self, "_obs_norm_scale")
 
 
     def functional_partial_reset(
