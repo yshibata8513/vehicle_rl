@@ -232,7 +232,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         N = self.Ns
 
         s_clamped = torch.clamp(s, self.s_ref[0], self.s_ref[-1] - 1e-6)
-        idx = torch.searchsorted(self.s_ref, s_clamped, right=False)
+        idx = torch.searchsorted(self.s_ref, s_clamped, right=True) - 1
         idx = torch.clamp(idx, 0, N - 2)
 
         s0 = self.s_ref[idx]
@@ -256,7 +256,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         s_q = torch.clamp(s_q, self.s_ref[0], self.s_ref[-1] - 1e-6)
 
         s_q_flat = s_q.reshape(-1)
-        idx_q = torch.searchsorted(self.s_ref, s_q_flat, right=False)
+        idx_q = torch.searchsorted(self.s_ref, s_q_flat, right=True) - 1
         idx_q = torch.clamp(idx_q, 0, N - 2)
 
         s0_q = self.s_ref[idx_q]
@@ -385,7 +385,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         # curvature tracking (path curvature from lateral accel)
         v_eff = torch.clamp(v, min=float(getattr(self.vehicle, 'v_eff_min', 1e-3)))
         v_kappa = torch.clamp(v, min=1e-3)
-        kappa_hat = a_y.detach() / (v_eff * v_kappa)
+        kappa_hat = a_y / (v_eff * v_kappa)
         _sign = torch.sign(kappa0)
         same_dir = (_sign * kappa_hat > 0).to(kappa_hat.dtype)
         e_kappa = _sign * (kappa0 - kappa_hat)

@@ -115,10 +115,6 @@ class SquashedGaussianActor(nn.Module):
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
 
-        if action_min is None:
-            action_min = -torch.ones(action_dim)
-        if action_max is None:
-            action_max = torch.ones(action_dim)
 
         self.register_buffer("action_min", action_min)
         self.register_buffer("action_max", action_max)
@@ -244,8 +240,8 @@ class SAPOAgentBatched:
             obs_dim=obs_dim,
             action_dim=action_dim,
             hidden_dim=self.cfg.hidden_dim,
-            action_min=None if action_min is None else torch.as_tensor(action_min, device=device, dtype=dtype),
-            action_max=None if action_max is None else torch.as_tensor(action_max, device=device, dtype=dtype),
+            action_min=torch.as_tensor(action_min, device=device, dtype=dtype),
+            action_max=torch.as_tensor(action_max, device=device, dtype=dtype),
         ).to(device=device, dtype=dtype)
 
         # double critic (value ensemble)
