@@ -116,12 +116,9 @@ def generate_random_reference_trajectory_arc_mix(
 
         # セグメントごとの速度をサンプル（遷移+一定曲率で同一速度）
         # 上限は曲率と許容横Gから決める: a_y = v^2*|kappa| <= a_lat_max
-        # ここで mu_val を考慮して物理限界も意識してもよいが、一旦 a_lat_max_g でキャップする
         G0 = 9.80665
         if abs(kappa_target) > 1e-9:
-            # mu が低い場合はそちらで制限する (物理限界 mu*g)
-            eff_a_lat_g = min(a_lat_max_g, mu_val)
-            a_lat_max = eff_a_lat_g * G0
+            a_lat_max = a_lat_max_g * G0
             v_cap_ms = np.sqrt(a_lat_max / abs(kappa_target))
             v_cap_kph = min(v_max_kph, v_cap_ms * 3.6)
         else:
