@@ -10,16 +10,7 @@ class ReferenceTrajectory:
     y_ref: np.ndarray
     kappa_ref: np.ndarray
     v_ref: np.ndarray
-    dt: float
-
-# 既にどこかで定義済みの想定
-@dataclass
-class ReferenceTrajectory:
-    s_ref: np.ndarray
-    x_ref: np.ndarray
-    y_ref: np.ndarray
-    kappa_ref: np.ndarray
-    v_ref: np.ndarray
+    mu_ref: np.ndarray
     dt: float
 
 
@@ -41,6 +32,8 @@ def generate_random_reference_trajectory_arc_mix(
     P_allow: float = 0.6,           # 許容遠心加速度変化率（横方向ジャーク）[m/s^3]
     t_min: float = 3.0,             # 緩和走行時間の下限 [s]（0.0 で無効化）
     a_lat_max_g: float = 0.30,   # 許容横G（例: 0.15〜0.25 など）
+    mu_min: float = 0.1,            # 摩擦係数の最小値 [-]
+    mu_max: float = 1.0,            # 摩擦係数の最大値 [-]
 ) -> ReferenceTrajectory:
     """
     直線＋円弧＋線形曲率遷移をランダムに組み合わせた ReferenceTrajectory を生成する。
@@ -216,12 +209,19 @@ def generate_random_reference_trajectory_arc_mix(
         x_ref[i] = x_ref[i - 1] + np.cos(psi[i - 1]) * ds
         y_ref[i] = y_ref[i - 1] + np.sin(psi[i - 1]) * ds
 
+    # -------------------------------------------------
+    # μ(s) を生成（トラジェクトリ全体で一定のランダム値）
+    # -------------------------------------------------
+    mu_value = rng.uniform(mu_min, mu_max)
+    mu_ref = np.full_like(s_ref, mu_value)
+    
     return ReferenceTrajectory(
         s_ref=s_ref,
         x_ref=x_ref,
         y_ref=y_ref,
         kappa_ref=kappa_ref,
         v_ref=v_ref,
+        mu_ref=mu_ref,
         dt=dt,
     )
 
