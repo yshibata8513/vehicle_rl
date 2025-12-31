@@ -80,18 +80,16 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         self.dt_internal = float(dt_internal)
         self.v_eff_min = float(v_eff_min)
 
+        # precompute constant values (independent of mu)
+        p = self.params
+        self.L = p.lf + p.lr
+        self.Fzf = (p.m * p.g) * (p.lr / self.L)  # front axle normal load
+        self.Fzr = (p.m * p.g) * (p.lf / self.L)  # rear axle normal load
+
         # stateful buffers (optional; for env-style usage)
         self.state: torch.Tensor = torch.zeros(1, 9, device=self.device, dtype=self.dtype)
         self.F_yf: torch.Tensor = torch.zeros(1, device=self.device, dtype=self.dtype)
         self.F_yr: torch.Tensor = torch.zeros(1, device=self.device, dtype=self.dtype)
-
-        # precompute constant tire-force saturation bounds from static normal loads
-        p = self.params
-        L = p.lf + p.lr
-        Fzf = (p.m * p.g) * (p.lr / L)
-        Fzr = (p.m * p.g) * (p.lf / L)
-        self._Fy_f_max = float(p.mu * Fzf)
-        self._Fy_r_max = float(p.mu * Fzr)
 
     @property
     def batch_size(self) -> int:
@@ -107,12 +105,19 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         self,
         alpha_f: torch.Tensor,
         alpha_r: torch.Tensor,
+        mu: torch.Tensor,
         *,
         util_threshold: float = 0.8,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute slip-angle excess beyond the slip angle that corresponds to a given
         tire utilization threshold (|Fy|/Fy_max = util_threshold) under the tanh model.
+
+        Args:
+            alpha_f: (B,) front slip angle
+            alpha_r: (B,) rear slip angle
+            mu: (B,) friction coefficient for each batch
+            util_threshold: tire utilization threshold
 
         Returns:
             alpha_excess_f, alpha_excess_r, alpha_th_f, alpha_th_r
@@ -123,8 +128,9 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         u_th = max(0.0, min(u_th, 0.999))
         u_th_t = torch.as_tensor(u_th, device=self.device, dtype=self.dtype)
 
-        Fy_f_max = torch.as_tensor(self._Fy_f_max, device=self.device, dtype=self.dtype)
-        Fy_r_max = torch.as_tensor(self._Fy_r_max, device=self.device, dtype=self.dtype)
+        # Calculate tire force saturation limits from mu
+        Fy_f_max = mu * self.Fzf  # (B,)
+        Fy_r_max = mu * self.Fzr  # (B,)
 
         # |tanh(C*alpha/Fmax)| = u_th  =>  |alpha| = (Fmax/C) * atanh(u_th)
         alpha_th_f = (Fy_f_max / torch.as_tensor(p.Cf, device=self.device, dtype=self.dtype)) * torch.atanh(u_th_t)
@@ -141,13 +147,25 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         r: torch.Tensor,
         v_eff: torch.Tensor,
         delta: torch.Tensor,
+        mu: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate tire forces with saturation based on current mu values.
+
+        Args:
+            beta: (B,) sideslip angle
+            r: (B,) yaw rate
+            v_eff: (B,) effective velocity
+            delta: (B,) steering angle
+            mu: (B,) friction coefficient for each batch
+        """
         p = self.params
         alpha_f = beta + p.lf * r / v_eff - delta
         alpha_r = beta - p.lr * r / v_eff
 
-        Fy_f_max = torch.as_tensor(self._Fy_f_max, device=self.device, dtype=self.dtype)
-        Fy_r_max = torch.as_tensor(self._Fy_r_max, device=self.device, dtype=self.dtype)
+        # Calculate tire force saturation limits from mu
+        Fy_f_max = mu * self.Fzf  # (B,)
+        Fy_r_max = mu * self.Fzr  # (B,)
 
         # F = F_max * tanh( -Cf * alpha / F_max )
         F_yf = Fy_f_max * torch.tanh(-p.Cf * alpha_f / Fy_f_max)
@@ -159,14 +177,19 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         self,
         state: torch.Tensor,
         action: torch.Tensor,
+        mu: torch.Tensor,
         dt: float,
         return_info: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """
-        Differentiable one-step transition: next_state = f(state, action, dt)
+        Differentiable one-step transition: next_state = f(state, action, mu, dt)
 
-        state: (B,9) or (B,8). If (B,8), delta_ref is initialized to delta.
-        action: (B,2) = [a_ref, delta_ref_cmd]
+        Args:
+            state: (B,9) or (B,8). If (B,8), delta_ref is initialized to delta.
+            action: (B,2) = [a_ref, delta_ref_cmd]
+            mu: (B,) friction coefficient for each batch
+            dt: time step
+            return_info: whether to return additional info dict
         """
         if state.dim() != 2:
             raise ValueError(f"state must be 2D (B,8|9), got {tuple(state.shape)}")
@@ -223,7 +246,7 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
 
             # tire forces
             alpha_f, alpha_r = self.slip_angles(beta=beta, r=r, v_eff=v_eff, delta=delta)
-            F_yf, F_yr = self.tire_forces_with_saturation(beta=beta, r=r, v_eff=v_eff, delta=delta)
+            F_yf, F_yr = self.tire_forces_with_saturation(beta=beta, r=r, v_eff=v_eff, delta=delta, mu=mu)
             last_F_yf, last_F_yr = F_yf, F_yr
             last_alpha_f, last_alpha_r = alpha_f, alpha_r
 
@@ -319,15 +342,23 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
     def max_speed_for_kappa(
         self,
         kappa: torch.Tensor,
+        mu: torch.Tensor,
         v_max_in: Optional[torch.Tensor] = None,
         eps: float = 1e-8,
     ) -> torch.Tensor:
         """
         Lateral acceleration limit: v <= sqrt(mu*g / |kappa|).
+
+        Args:
+            kappa: (B,) or scalar curvature values
+            mu: (B,) friction coefficient for each batch
+            v_max_in: optional max speed constraint
+            eps: small value to avoid division by zero
         """
         p = self.params
         kappa_t = torch.as_tensor(kappa, device=self.device, dtype=self.dtype)
-        mu_g = torch.as_tensor(p.mu * p.g, device=self.device, dtype=self.dtype)
+        mu_t = torch.as_tensor(mu, device=self.device, dtype=self.dtype)
+        mu_g = mu_t * p.g
         denom = torch.abs(kappa_t) + float(eps)
         v_limit = torch.sqrt(mu_g / denom)
         if v_max_in is None:

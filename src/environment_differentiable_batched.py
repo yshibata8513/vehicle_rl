@@ -65,6 +65,8 @@ class ObsNormalizationConfig:
     a_min: float
     a_max: float
     delta_max: float
+    mu_min: float = 0.0
+    mu_max: float = 1.0
 
 
 @dataclass
@@ -141,18 +143,21 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         self.v_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
         self.kappa_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
         self.psi_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
+        self.mu_ref_mat = torch.zeros(self.B, N, dtype=self.dtype, device=self.device)
 
         for b, traj in enumerate(ref_trajs):
             x_ref = np.asarray(traj.x_ref, dtype=np.float64)
             y_ref = np.asarray(traj.y_ref, dtype=np.float64)
             v_ref = np.asarray(traj.v_ref, dtype=np.float64)
             kappa_ref = np.asarray(traj.kappa_ref, dtype=np.float64)
+            mu_ref = np.asarray(traj.mu_ref, dtype=np.float64)
 
-            if not (len(x_ref) == N and len(y_ref) == N and len(v_ref) == N and len(kappa_ref) == N):
+            if not (len(x_ref) == N and len(y_ref) == N and len(v_ref) == N and len(kappa_ref) == N and len(mu_ref) == N):
                 raise ValueError("All reference arrays must have same length as s_ref")
 
             self.v_ref_mat[b] = torch.tensor(v_ref.tolist(), dtype=self.dtype, device=self.device)
             self.kappa_ref_mat[b] = torch.tensor(kappa_ref.tolist(), dtype=self.dtype, device=self.device)
+            self.mu_ref_mat[b] = torch.tensor(mu_ref.tolist(), dtype=self.dtype, device=self.device)
 
             dx = np.diff(x_ref)
             dy = np.diff(y_ref)
@@ -269,6 +274,10 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         y_flat = (1.0 - t_q) * y0_q + t_q * y1_q
         return y_flat.view(B, P)
 
+    def get_current_mu(self, env_state: BatchedFrenetEnvState) -> torch.Tensor:
+        """現在のs座標における各環境のμ値を取得"""
+        return self._interp_matrix(env_state.s, self.mu_ref_mat)  # (B,)
+
     # -----------------
     # observation and reward (pure functions)
     # -----------------
@@ -290,6 +299,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         delta_ref = env_state.vehicle_state[:, 8]
 
         v_ref_now = self._interp_matrix(env_state.s, self.v_ref_mat)
+        mu_now = self.get_current_mu(env_state)
         kappa_preview = self._interp_matrix_preview(env_state.s, self.kappa_ref_mat, self.kappa_preview_offsets)
         v_preview = self._interp_matrix_preview(env_state.s, self.v_ref_mat, self.v_preview_offsets)
 
@@ -312,6 +322,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             env_state.delta_ref_history,  # (B,5)
             kappa_preview,                # (B,P)
             v_preview,                    # (B,Q)
+            mu_now,                       # (B,) → (B,1)
         ]
         obs = torch.cat([x if x.dim() == 2 else x.unsqueeze(1) for x in obs_list], dim=1)
         state_vec = torch.stack([e_y, e_psi_v, v, a, delta, delta_ref, beta, r], dim=1)
@@ -391,9 +402,11 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         e_kappa = _sign * (kappa0 - kappa_hat)
         cost_kappa = w.w_kappa * self._penalty(torch.relu(e_kappa), w.loss_kappa) * same_dir        
 
+        current_mu = self.get_current_mu(env_state)
         alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = self.vehicle.tire_alpha_excess_from_alphas(
             alpha_f=alpha_f,
             alpha_r=alpha_r,
+            mu=current_mu,
             util_threshold=float(getattr(w, 'tire_util_threshold', 0.8)),
         )
         cost_tire_alpha_excess = w.w_tire_alpha_excess * (
@@ -432,6 +445,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 "d_delta_ref": d_delta_ref,
                 "dd_delta_ref": dd_delta_ref,
                 "delta_ref": delta_ref,
+                "mu_current": self.get_current_mu(env_state),
                 "done_lateral": done_lateral,
                 "done_pathend": done_pathend,
                 "done_steps": done_steps,
@@ -468,6 +482,9 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         """
         if not (action.shape[0] == self.B and action.shape[1] == 2):
             raise ValueError(f"action must be (B,2) with B={self.B}, got {tuple(action.shape)}")
+
+        # 現在のμ値を取得
+        current_mu = self.get_current_mu(env_state)
 
         dt = float(self.dt)
         dt_t = torch.as_tensor(dt, dtype=self.dtype, device=self.device)
@@ -521,7 +538,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             return s, e_y, e_psi_v
 
         for _ in range(n_full):
-            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_int, return_info=True)
+            veh, vinfo = self.vehicle.functional_step(veh, action, current_mu, dt=dt_int, return_info=True)
             F_yf = vinfo.get("F_yf", None)
             F_yr = vinfo.get("F_yr", None)
             alpha_f = vinfo.get("alpha_f", None)
@@ -529,7 +546,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_int)
 
         if dt_rem > 0.0:
-            veh, vinfo = self.vehicle.functional_step(veh, action, dt=dt_rem, return_info=True)
+            veh, vinfo = self.vehicle.functional_step(veh, action, current_mu, dt=dt_rem, return_info=True)
             F_yf = vinfo.get("F_yf", None)
             F_yr = vinfo.get("F_yr", None)
             alpha_f = vinfo.get("alpha_f", None)
@@ -699,7 +716,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
 
         P = int(self.P)
         Q = int(self.Q)
-        obs_dim_expected = 6 + 5 + P + Q
+        obs_dim_expected = 7 + 5 + P + Q
 
         obs_min = torch.empty(obs_dim_expected, device=device, dtype=dtype)
         obs_max = torch.empty(obs_dim_expected, device=device, dtype=dtype)
@@ -723,6 +740,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         obs_min[i:i+Q] = config.v_ref_min
         obs_max[i:i+Q] = config.v_ref_max
         i += Q
+
+        obs_min[i], obs_max[i] = config.mu_min, config.mu_max; i += 1
 
         if i != obs_dim_expected:
             raise RuntimeError(f"obs_dim mismatch in normalizer build: got {i}, expected {obs_dim_expected}")
@@ -796,8 +815,14 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
                 dtype=self.dtype,
                 device=self.device,
             )
+            mu_ref = torch.tensor(
+                np.asarray(traj.mu_ref, dtype=np.float64).tolist(),
+                dtype=self.dtype,
+                device=self.device,
+            )
             self.v_ref_mat[b] = v_ref
             self.kappa_ref_mat[b] = kappa_ref
+            self.mu_ref_mat[b] = mu_ref
 
             x_ref = np.asarray(traj.x_ref, dtype=np.float64)
             y_ref = np.asarray(traj.y_ref, dtype=np.float64)

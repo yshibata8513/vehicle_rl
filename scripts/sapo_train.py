@@ -43,7 +43,8 @@ from environment_differentiable_batched import (
 from sapo_agent_batched import SAPOAgentBatched, SAPOConfig
 
 
-CKPT_PATH = "./checkpoints_sapo/sapo_20251228_141239_update00250.pt"
+CKPT_PATH = "./checkpoints_sapo/sapo_20251231_024154_update01400.pt"
+
 
 
 from trajectory_generator import (
@@ -67,6 +68,8 @@ def make_train_traj(
     v_max_kph: float,
     R_min: float,
     R_max: float,
+    mu_min: float = 0.1,
+    mu_max: float = 1.0,
     seed: Optional[int] = None,
 ):
     if generate_random_reference_trajectory_arc_mix is None:
@@ -83,6 +86,8 @@ def make_train_traj(
         v_max_kph=v_max_kph,
         R_min=R_min,
         R_max=R_max,
+        mu_min=mu_min,
+        mu_max=mu_max,
         seed=seed,
     )
 
@@ -452,10 +457,13 @@ def evaluate_policy_detailed(
         # if alpha_f is None or alpha_r is None:
         #     tire_alpha_excess_total = torch.zeros_like(v)
         # else:
+        mu = env.get_current_mu(env.get_env_state())
+
         alpha_excess_f, alpha_excess_r, _alpha_th_f, _alpha_th_r = env.vehicle.tire_alpha_excess_from_alphas(
             alpha_f=alpha_f,
             alpha_r=alpha_r,
             util_threshold=float(getattr(env.weights, "tire_util_threshold", 0.8)),
+            mu=mu,
         )
         tire_alpha_excess_total = alpha_excess_f + alpha_excess_r
 
@@ -794,8 +802,10 @@ def main():
     parser.add_argument("--v-max-kph", type=float, default=100.0)
     parser.add_argument("--R-min", type=float, default=60.0)
     parser.add_argument("--R-max", type=float, default=100.0)
+    parser.add_argument("--mu-min", type=float, default=0.2, help="最小摩擦係数")
+    parser.add_argument("--mu-max", type=float, default=0.6, help="最大摩擦係数")
     parser.add_argument("--max-steps", type=int, default=2000)
-    parser.add_argument("--kappa-preview", type=int, default=21)
+    parser.add_argument("--kappa-preview", type=int, default=20)
     parser.add_argument("--kappa-interval", type=float, default=3.0)
     parser.add_argument("--v-preview", type=int, default=0)
     parser.add_argument("--v-interval", type=float, default=3.0)
@@ -806,7 +816,7 @@ def main():
     parser.add_argument("--w-v-under", type=float, default=0.05)
     parser.add_argument("--w-v-over", type=float, default=0.5)
     parser.add_argument("--w-ay", type=float, default=0.1)
-    parser.add_argument("--w-kappa", type=float, default=0.001)
+    parser.add_argument("--w-kappa", type=float, default=0.01)
     parser.add_argument("--w-d-delta-ref", type=float, default=1.0)
     parser.add_argument("--w-dd-delta-ref", type=float, default=0.1)
     parser.add_argument("--w-tire-alpha-excess", type=float, default=1.)
@@ -887,15 +897,20 @@ def main():
         if R_min > 0.0:
             kappa_min = 1.0 / R_min
             _tmp_model = BatchedDifferentiableDynamicBicycleModel(params=veh_params, device=str(device), dtype=dtype)
+            # Use mu_min for worst-case feasibility check
+            mu_min_tensor = torch.as_tensor(args.mu_min, device=device, dtype=dtype)
             v_lim = float(
-                _tmp_model.max_speed_for_kappa(torch.as_tensor(kappa_min, device=device, dtype=dtype))
+                _tmp_model.max_speed_for_kappa(
+                    torch.as_tensor(kappa_min, device=device, dtype=dtype),
+                    mu_min_tensor
+                )
                 .detach()
                 .cpu()
                 .item()
             )
             print(
                 f"[Traj] R_min={R_min:.3f} m -> kappa={kappa_min:.6f} 1/m -> "
-                f"max_speed_for_kappa={v_lim:.3f} m/s ({v_lim*3.6:.1f} km/h)"
+                f"max_speed_for_kappa={v_lim:.3f} m/s ({v_lim*3.6:.1f} km/h) @ mu={args.mu_min}"
             )
         else:
             print(f"[Traj] R_min must be > 0, got {R_min}")
@@ -912,6 +927,8 @@ def main():
             v_max_kph=float(args.v_max_kph),
             R_min=float(args.R_min),
             R_max=float(args.R_max),
+            mu_min=float(args.mu_min),
+            mu_max=float(args.mu_max),
             seed=None,
         )
         for _ in range(int(args.num_envs))
@@ -937,6 +954,8 @@ def main():
             v_max_kph=float(args.v_max_kph),
             R_min=float(args.R_min),
             R_max=float(args.R_max),
+            mu_min=float(args.mu_min),
+            mu_max=float(args.mu_max),
             seed=None,
         ),
         angle_wrap_mode="atan2",
@@ -962,6 +981,8 @@ def main():
         a_min=a_min,
         a_max=a_max,
         delta_max=delta_max,
+        mu_min=args.mu_min,
+        mu_max=args.mu_max,
     )
     env.init_obs_normalizer(obs_config)
 
@@ -986,6 +1007,8 @@ def main():
             v_max_kph=float(args.v_max_kph),
             R_min=float(args.R_min),
             R_max=float(args.R_max),
+            mu_min=float(args.mu_min),
+            mu_max=float(args.mu_max),
             seed=1000 + i,
         )
         for i in range(max(1, int(args.eval_envs)))
