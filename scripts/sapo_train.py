@@ -46,7 +46,6 @@ from sapo_agent_batched import SAPOAgentBatched, SAPOConfig
 CKPT_PATH = "./checkpoints_sapo/sapo_20251231_024154_update01400.pt"
 
 
-
 from trajectory_generator import (
     generate_random_reference_trajectory_arc_mix,
     calculate_max_curvature_rates,
@@ -853,8 +852,9 @@ def main():
     parser.add_argument("--reset-interval", type=int, default=0, help="if >0, reset env every N updates")
     parser.add_argument("--ckpt-interval", type=int, default=50)
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints_sapo")
-    parser.add_argument("--resume", type=bool, default=False)
+    parser.add_argument("--resume", type=str, default="./checkpoints_sapo/sapo_20251231_024154_update01400.pt", help="Path to checkpoint to resume from (default: None)")
     parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--eval-mode", type=bool, default=False)
 
     args = parser.parse_args()
 
@@ -998,21 +998,44 @@ def main():
     progress_jsonl = os.path.join(args.ckpt_dir, f"{run_id}_progress.jsonl")
 
     # ---- Eval env (fixed trajectories for comparable metrics) ----
-    eval_ref_trajs = [
-        make_train_traj(
-            dt=float(args.dt),
-            total_length=float(args.traj_length),
-            ds=float(args.ds),
-            v_min_kph=float(args.v_min_kph),
-            v_max_kph=float(args.v_max_kph),
-            R_min=float(args.R_min),
-            R_max=float(args.R_max),
-            mu_min=float(args.mu_min),
-            mu_max=float(args.mu_max),
-            seed=1000 + i,
-        )
-        for i in range(max(1, int(args.eval_envs)))
-    ]
+    if args.eval_mode:
+        base = np.linspace(args.mu_min, args.mu_max, 4)   # [min, ..., max]
+        mu_list = base[np.arange(args.eval_envs) % 4]
+        v = (args.v_min_kph + args.v_max_kph)/2.0
+        eval_ref_trajs = [
+            make_train_traj(
+                dt=float(args.dt),
+                total_length=float(args.traj_length),
+                ds=float(args.ds),
+                v_min_kph=v,
+                v_max_kph=v,
+                R_min=float(args.R_min),
+                R_max=float(args.R_min),
+                mu_min=mu_list[i],
+                mu_max=mu_list[i],
+                seed=1000,
+            )
+            for i in range(max(1, int(args.eval_envs)))
+        ]
+    else:
+        eval_ref_trajs = [
+            make_train_traj(
+                dt=float(args.dt),
+                total_length=float(args.traj_length),
+                ds=float(args.ds),
+                v_min_kph=float(args.v_min_kph),
+                v_max_kph=float(args.v_max_kph),
+                R_min=float(args.R_min),
+                R_max=float(args.R_max),
+                mu_min=float(args.mu_min),
+                mu_max=float(args.mu_max),
+                seed=1000 + i,
+            )
+            for i in range(max(1, int(args.eval_envs)))
+        ]
+    print("mu")
+    for i in range(4):
+        print(eval_ref_trajs[i].mu_ref[0])
     eval_env = BatchedPathTrackingEnvFrenetDifferentiable(
         ref_trajs=eval_ref_trajs,
         kappa_preview_offsets=kappa_preview_offsets,
@@ -1097,43 +1120,45 @@ def main():
 
         logs = agent.update(env)
 
-        if (update % int(args.log_interval)) == 0:
-            elapsed = time.time() - t0
-            env_dbg = collect_env_debug(env)
+        if args.eval_mode == False:
 
-            msg = (
-                f"[{run_id}] upd {update:05d} | "
-                f"actor {logs.get('actor_loss', float('nan')):+.4e} | "
-                f"critic {logs.get('critic_loss', float('nan')):+.4e} | "
-                f"alpha {logs.get('alpha', float('nan')):.4f} | "
-                f"H {logs.get('mean_entropy', float('nan')):.3f} | "
-                f"r {logs.get('mean_reward', float('nan')):.4f} | "
-                f"done {env_dbg.get('done_frac', float('nan')):.2f} | "
-                f"|ey| {env_dbg.get('ey_abs_mean', float('nan')):.3f} | "
-                f"|dv| {env_dbg.get('dv_abs_mean', float('nan')):.3f} | "
-                f"{elapsed/60.0:.1f} min"
-            )
-            print(msg)
+            if (update % int(args.log_interval)) == 0:
+                elapsed = time.time() - t0
+                env_dbg = collect_env_debug(env)
 
-            history.append(
-                {
-                    "update": float(update),
-                    "mean_reward": float(logs.get("mean_reward", float("nan"))),
-                    "actor_loss": float(logs.get("actor_loss", float("nan"))),
-                    "critic_loss": float(logs.get("critic_loss", float("nan"))),
-                    "alpha": float(logs.get("alpha", float("nan"))),
-                }
-            )
+                msg = (
+                    f"[{run_id}] upd {update:05d} | "
+                    f"actor {logs.get('actor_loss', float('nan')):+.4e} | "
+                    f"critic {logs.get('critic_loss', float('nan')):+.4e} | "
+                    f"alpha {logs.get('alpha', float('nan')):.4f} | "
+                    f"H {logs.get('mean_entropy', float('nan')):.3f} | "
+                    f"r {logs.get('mean_reward', float('nan')):.4f} | "
+                    f"done {env_dbg.get('done_frac', float('nan')):.2f} | "
+                    f"|ey| {env_dbg.get('ey_abs_mean', float('nan')):.3f} | "
+                    f"|dv| {env_dbg.get('dv_abs_mean', float('nan')):.3f} | "
+                    f"{elapsed/60.0:.1f} min"
+                )
+                print(msg)
 
-            if int(args.log_jsonl) == 1:
-                rec: Dict[str, Any] = {
-                    "run_id": run_id,
-                    "update": int(update),
-                    "elapsed_sec": float(elapsed),
-                    **{k: float(v) for k, v in logs.items()},
-                    "env": env_dbg,
-                }
-                _append_jsonl(progress_jsonl, rec)
+                history.append(
+                    {
+                        "update": float(update),
+                        "mean_reward": float(logs.get("mean_reward", float("nan"))),
+                        "actor_loss": float(logs.get("actor_loss", float("nan"))),
+                        "critic_loss": float(logs.get("critic_loss", float("nan"))),
+                        "alpha": float(logs.get("alpha", float("nan"))),
+                    }
+                )
+
+                if int(args.log_jsonl) == 1:
+                    rec: Dict[str, Any] = {
+                        "run_id": run_id,
+                        "update": int(update),
+                        "elapsed_sec": float(elapsed),
+                        **{k: float(v) for k, v in logs.items()},
+                        "env": env_dbg,
+                    }
+                    _append_jsonl(progress_jsonl, rec)
 
         if args.eval_interval and (update % int(args.eval_interval) == 0) and update != start_update:
             xy_path = os.path.join(args.ckpt_dir, f"{run_id}_eval_xy_update_{update:05d}.png")
@@ -1168,6 +1193,9 @@ def main():
             print(f"  mean tire_alpha_excess: {stats['tire_alpha_excess_mean']:.6f}")
             print(f"  mean cost_tire_alpha_excess: {stats['cost_tire_alpha_excess_mean']:.6f}")
             print(f"==============================\n")
+
+            if args.eval_mode:
+                return
 
             if int(args.log_jsonl) == 1:
                 _append_jsonl(progress_jsonl, {"run_id": run_id, "update": int(update), "eval": stats})
