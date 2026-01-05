@@ -286,7 +286,11 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
         if not return_info:
             return next_state, None
 
-        info = {"F_yf": last_F_yf, "F_yr": last_F_yr, "alpha_f": last_alpha_f, "alpha_r": last_alpha_r}
+        a_y = torch.zeros_like(mu)
+        if last_F_yf is not None and last_F_yr is not None:
+            a_y = (last_F_yf + last_F_yr) / p.m
+
+        info = {"F_yf": last_F_yf, "F_yr": last_F_yr, "alpha_f": last_alpha_f, "alpha_r": last_alpha_r, "a_y": a_y}
         return next_state, info
 
     # ---------- stateful API (env-style usage) ----------

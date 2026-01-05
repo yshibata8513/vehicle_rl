@@ -282,10 +282,20 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
     # observation and reward (pure functions)
     # -----------------
 
+    def get_kappa_preview(self, env_state: BatchedFrenetEnvState) -> torch.Tensor:
+        """Return curvature preview kappa(s + offsets). Shape: (B, P)."""
+        return self._interp_matrix_preview(env_state.s, self.kappa_ref_mat, self.kappa_preview_offsets)
+
+    def get_v_preview(self, env_state: BatchedFrenetEnvState) -> torch.Tensor:
+        """Return speed reference preview v_ref(s + offsets). Shape: (B, Q)."""
+        return self._interp_matrix_preview(env_state.s, self.v_ref_mat, self.v_preview_offsets)
+
     def compute_obs_state(
         self,
         env_state: BatchedFrenetEnvState,
         *,
+        action: Optional[torch.Tensor] = None,
+        a_y: Optional[torch.Tensor] = None,
         return_cache: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
@@ -299,9 +309,8 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         delta_ref = env_state.vehicle_state[:, 8]
 
         v_ref_now = self._interp_matrix(env_state.s, self.v_ref_mat)
-        mu_now = self.get_current_mu(env_state)
-        kappa_preview = self._interp_matrix_preview(env_state.s, self.kappa_ref_mat, self.kappa_preview_offsets)
-        v_preview = self._interp_matrix_preview(env_state.s, self.v_ref_mat, self.v_preview_offsets)
+        kappa_preview = self.get_kappa_preview(env_state)
+        # v_preview = self.get_v_preview(env_state)
 
         # kappa0 is used for dynamics reward and frenet update
         if float(self.kappa_preview_offsets[0].item()) == 0.0:
@@ -312,17 +321,19 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         e_y = env_state.e_y
         e_psi_v = self._wrap_angle(env_state.e_psi_v)
 
+        # action / info may be unavailable (e.g., reset); fill with zeros in that case
+        a_ref = torch.clamp(action[:, 0], self.vehicle.params.min_accel, self.vehicle.params.max_accel)
+        a_y_obs = a_y
+
         obs_list = [
             e_y,
             e_psi_v,
             v,
-            a,
+            a,          # a_x
+            a_y_obs,    # a_y
+            delta_ref,
+            a_ref,
             r,
-            v_ref_now,
-            env_state.delta_ref_history,  # (B,5)
-            kappa_preview,                # (B,P)
-            v_preview,                    # (B,Q)
-            mu_now,                       # (B,) → (B,1)
         ]
         obs = torch.cat([x if x.dim() == 2 else x.unsqueeze(1) for x in obs_list], dim=1)
         state_vec = torch.stack([e_y, e_psi_v, v, a, delta, delta_ref, beta, r], dim=1)
@@ -337,6 +348,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             "v_ref_now": v_ref_now,
             "kappa0": kappa0,
             "kappa_preview": kappa_preview,
+            # "v_preview": v_preview,
             "e_y": e_y,
             "e_psi_v": e_psi_v,
         }
@@ -508,6 +520,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         F_yr = None
         alpha_f = None
         alpha_r = None
+        a_y = None
 
         def frenet_substep(
             veh_state: torch.Tensor,
@@ -543,6 +556,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             F_yr = vinfo.get("F_yr", None)
             alpha_f = vinfo.get("alpha_f", None)
             alpha_r = vinfo.get("alpha_r", None)
+            a_y = vinfo.get("a_y", None)
             s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_int)
 
         if dt_rem > 0.0:
@@ -551,6 +565,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
             F_yr = vinfo.get("F_yr", None)
             alpha_f = vinfo.get("alpha_f", None)
             alpha_r = vinfo.get("alpha_r", None)
+            a_y = vinfo.get("a_y", None)
             s, e_y, e_psi_v = frenet_substep(veh, s, e_y, e_psi_v, dt_rem)
 
         next_vehicle_state = veh
@@ -587,7 +602,7 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         dd_delta_ref = dd_delta_ref * valid
 
         # --- obs/state ---
-        obs_raw, state_vec, _cache = self.compute_obs_state(next_env_state, return_cache=True)
+        obs_raw, state_vec, _cache = self.compute_obs_state(next_env_state, action=action, a_y=a_y, return_cache=True)
         obs_out = self.normalize_obs(obs_raw, clip=obs_clip) if normalize_obs else obs_raw
 
         # --- reward/done/info ---
@@ -716,32 +731,22 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
 
         P = int(self.P)
         Q = int(self.Q)
-        obs_dim_expected = 7 + 5 + P + Q
+        obs_dim_expected = 8
 
         obs_min = torch.empty(obs_dim_expected, device=device, dtype=dtype)
         obs_max = torch.empty(obs_dim_expected, device=device, dtype=dtype)
+
+        ay_max = max(1.0, (v_max ** 2) * float(config.kappa_max))
 
         i = 0
         obs_min[i], obs_max[i] = -ey_max, ey_max; i += 1
         obs_min[i], obs_max[i] = -epsi_max, epsi_max; i += 1
         obs_min[i], obs_max[i] = v_min, v_max; i += 1
-        obs_min[i], obs_max[i] = config.a_min, config.a_max; i += 1
-        obs_min[i], obs_max[i] = -r_max, r_max; i += 1
-        obs_min[i], obs_max[i] = config.v_ref_min, config.v_ref_max; i += 1
-
-        obs_min[i:i+5] = -config.delta_max
-        obs_max[i:i+5] = config.delta_max
-        i += 5
-
-        obs_min[i:i+P] = -config.kappa_max
-        obs_max[i:i+P] = config.kappa_max
-        i += P
-
-        obs_min[i:i+Q] = config.v_ref_min
-        obs_max[i:i+Q] = config.v_ref_max
-        i += Q
-
-        obs_min[i], obs_max[i] = config.mu_min, config.mu_max; i += 1
+        obs_min[i], obs_max[i] = config.a_min, config.a_max; i += 1       # a_x
+        obs_min[i], obs_max[i] = -ay_max, ay_max; i += 1                  # a_y
+        obs_min[i], obs_max[i] = -config.delta_max, config.delta_max; i += 1  # delta_ref
+        obs_min[i], obs_max[i] = config.a_min, config.a_max; i += 1       # a_ref
+        obs_min[i], obs_max[i] = -r_max, r_max; i += 1                    # r
 
         if i != obs_dim_expected:
             raise RuntimeError(f"obs_dim mismatch in normalizer build: got {i}, expected {obs_dim_expected}")
