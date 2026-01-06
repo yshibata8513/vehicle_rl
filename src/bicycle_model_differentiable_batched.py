@@ -277,6 +277,9 @@ class BatchedDifferentiableDynamicBicycleModel(nn.Module):
             v = torch.clamp(v, min=0.0)
             delta = torch.clamp(delta, -p.max_steer, p.max_steer)
 
+            if not torch.isfinite(v).all() or not torch.isfinite(beta).all() or not torch.isfinite(r).all():
+                raise RuntimeError("Non-finite in vehicle dynamics (check mu==0 causing 0/0 in tire model)")
+
         for _ in range(n_full):
             substep(dt_int)
         substep(dt_rem)

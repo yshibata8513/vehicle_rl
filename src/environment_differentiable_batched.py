@@ -322,8 +322,15 @@ class BatchedPathTrackingEnvFrenetDifferentiable:
         e_psi_v = self._wrap_angle(env_state.e_psi_v)
 
         # action / info may be unavailable (e.g., reset); fill with zeros in that case
-        a_ref = torch.clamp(action[:, 0], self.vehicle.params.min_accel, self.vehicle.params.max_accel)
-        a_y_obs = a_y
+        if action is None:
+            a_ref = torch.zeros_like(v)
+        else:
+            a_ref = torch.clamp(action[:, 0], self.vehicle.params.min_accel, self.vehicle.params.max_accel)
+
+        if a_y is None:
+            a_y_obs = torch.zeros_like(v)
+        else:
+            a_y_obs = a_y
 
         obs_list = [
             e_y,

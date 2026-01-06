@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributions as D
+from torch.nn.parameter import UninitializedParameter
 
 
 # -----------------------------
@@ -555,11 +556,37 @@ class SAPOAgentBatched:
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
+    
+    def _ensure_lazy_initialized(self, hist_seq: torch.Tensor, preview: Optional[torch.Tensor]) -> None:
+        """Initialize LazyLinear parameters (if any) by running a dummy forward pass."""
+        needs_init = False
+        for mod in (self.actor, self.critic1, self.critic2):
+            for p in mod.parameters():
+                if isinstance(p, UninitializedParameter):
+                    needs_init = True
+                    break
+            if needs_init:
+                break
+        if not needs_init:
+            return
+
+        if preview is None:
+            preview = hist_seq.new_zeros((hist_seq.size(0), 0))
+
+        with torch.no_grad():
+            _ = self.actor(hist_seq, preview)
+            _ = self.critic1(hist_seq, preview)
+            _ = self.critic2(hist_seq, preview)
+
     def _freeze_critics(self, freeze: bool) -> None:
-        for p in self.critic1.parameters():
-            p.requires_grad_(not freeze)
-        for p in self.critic2.parameters():
-            p.requires_grad_(not freeze)
+            for p in self.critic1.parameters():
+                if isinstance(p, UninitializedParameter):
+                    continue
+                p.requires_grad_(not freeze)
+            for p in self.critic2.parameters():
+                if isinstance(p, UninitializedParameter):
+                    continue
+                p.requires_grad_(not freeze)
 
     def _compute_v(self, obs: torch.Tensor, preview: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         v1 = self.critic1(obs, preview)
@@ -602,6 +629,7 @@ class SAPOAgentBatched:
         hist_seq = torch.zeros((self.num_envs, L_hist, self.obs_dim), device=self.device, dtype=self.dtype)
         hist_seq[:, -1, :] = obs0
         preview_t = _get_preview(env_state)
+        self._ensure_lazy_initialized(hist_seq, preview_t)
 
         # lists for actor objective (graph-connected)
         rewards_g: List[torch.Tensor] = []
